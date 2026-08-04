@@ -1,0 +1,403 @@
+#include "cutriton/ir/pass.h"
+
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+#include <set>
+#include <unordered_set>
+
+namespace cutriton {
+namespace {
+
+//计算总的元素个数
+int64_t Product(const std::vector<int64_t>& dims, std::size_t begin,
+                std::size_t end) {
+  int64_t value = 1;
+  for (std::size_t i = begin; i < end; ++i) {
+    if (dims[i] <= 0) {
+      return 0;
+    }
+    value *= dims[i];
+  }
+  return value;
+}
+
+TensorDesc SameAsFirstInput(const Graph& graph, const Node& node) {
+  if (node.inputs().empty()) {
+    return {};
+  }
+  const auto* input = graph.FindValue(node.inputs().front());
+  return input == nullptr ? TensorDesc{} : input->tensor;
+}
+
+Status SetOutputLikeInput(Graph* graph, const Node& node) {
+  const TensorDesc desc = SameAsFirstInput(*graph, node);
+  if (desc.dtype == DataType::kUnknown) {
+    return Status::ShapeError("无法推导节点形状: " + node.name());
+  }
+  for (const auto& output : node.outputs()) {
+    CUTRITON_RETURN_IF_ERROR(graph->SetValueDesc(output, desc));
+  }
+  return Status::OK();
+}
+
+Status InferConvLike(Graph* graph, const Node& node) {
+  if (node.inputs().size() < 2 || node.outputs().empty()) {
+    return Status::ShapeError("Conv 类节点需要输入、权重和输出");
+  }
+  const auto* input = graph->FindValue(node.inputs()[0]);
+  const auto* weight = graph->FindValue(node.inputs()[1]);
+  if (input == nullptr || weight == nullptr) {
+    return Status::ShapeError("Conv 类节点引用了未定义 Tensor");
+  }
+  const auto& in_shape = input->tensor.shape;
+  const auto& w_shape = weight->tensor.shape;
+  if (in_shape.size() != 4 || w_shape.size() != 4) {
+    return Status::ShapeError("V1 Conv 期望 NCHW 输入和 OIHW 权重");
+  }
+
+  const auto strides = GetIntListAttribute(node, "strides", {1, 1});
+  const auto pads = GetIntListAttribute(node, "pads", {0, 0, 0, 0});
+  const auto dilations = GetIntListAttribute(node, "dilations", {1, 1});
+  if (strides.size() != 2 || pads.size() != 4 || dilations.size() != 2) {
+    return Status::ShapeError("Conv 属性必须是 strides[2]、pads[4]、dilations[2]");
+  }
+
+  const int64_t kernel_h = w_shape[2];
+  const int64_t kernel_w = w_shape[3];
+  const int64_t out_h =
+      (in_shape[2] + pads[0] + pads[2] - dilations[0] * (kernel_h - 1) - 1) /
+          strides[0] +
+      1;
+  const int64_t out_w =
+      (in_shape[3] + pads[1] + pads[3] - dilations[1] * (kernel_w - 1) - 1) /
+          strides[1] +
+      1;
+  TensorDesc desc({in_shape[0], w_shape[0], out_h, out_w}, input->tensor.dtype,
+                  input->tensor.device_type, input->tensor.device_id,
+                  input->tensor.layout);
+  CUTRITON_RETURN_IF_ERROR(desc.Validate());
+  return graph->SetValueDesc(node.outputs()[0], std::move(desc));
+}
+
+Status InferPool(Graph* graph, const Node& node) {
+  const auto* input = graph->FindValue(node.inputs().front());
+  if (input == nullptr || input->tensor.shape.size() != 4) {
+    return Status::ShapeError("Pool 期望 NCHW 输入");
+  }
+  const auto kernel = GetIntListAttribute(node, "kernel_shape", {1, 1});
+  const auto strides = GetIntListAttribute(node, "strides", kernel);
+  const auto pads = GetIntListAttribute(node, "pads", {0, 0, 0, 0});
+  if (kernel.size() != 2 || strides.size() != 2 || pads.size() != 4) {
+    return Status::ShapeError("Pool 属性必须是 kernel_shape[2]、strides[2]、pads[4]");
+  }
+  const auto& shape = input->tensor.shape;
+  const int64_t out_h = (shape[2] + pads[0] + pads[2] - kernel[0]) / strides[0] + 1;
+  const int64_t out_w = (shape[3] + pads[1] + pads[3] - kernel[1]) / strides[1] + 1;
+  TensorDesc desc({shape[0], shape[1], out_h, out_w}, input->tensor.dtype,
+                  input->tensor.device_type, input->tensor.device_id,
+                  input->tensor.layout);
+  CUTRITON_RETURN_IF_ERROR(desc.Validate());
+  return graph->SetValueDesc(node.outputs()[0], std::move(desc));
+}
+
+Status InferFlatten(Graph* graph, const Node& node) {
+  const auto* input = graph->FindValue(node.inputs().front());
+  if (input == nullptr || input->tensor.shape.empty()) {
+    return Status::ShapeError("Flatten 期望已知输入形状");
+  }
+  const auto& shape = input->tensor.shape;
+  int64_t axis = GetIntAttribute(node, "axis", 1);
+  if (axis < 0) {
+    axis += static_cast<int64_t>(shape.size());
+  }
+  if (axis < 0 || axis > static_cast<int64_t>(shape.size())) {
+    return Status::ShapeError("Flatten axis 超出输入 rank");
+  }
+  TensorDesc desc({Product(shape, 0, static_cast<std::size_t>(axis)),
+                   Product(shape, static_cast<std::size_t>(axis), shape.size())},
+                  input->tensor.dtype, input->tensor.device_type,
+                  input->tensor.device_id, "");
+  CUTRITON_RETURN_IF_ERROR(desc.Validate());
+  return graph->SetValueDesc(node.outputs()[0], std::move(desc));
+}
+
+Status InferGemm(Graph* graph, const Node& node) {
+  if (node.inputs().size() < 2) {
+    return Status::ShapeError("Gemm 期望两个输入");
+  }
+  const auto* a = graph->FindValue(node.inputs()[0]);
+  const auto* b = graph->FindValue(node.inputs()[1]);
+  if (a == nullptr || b == nullptr || a->tensor.shape.size() != 2 ||
+      b->tensor.shape.size() != 2) {
+    return Status::ShapeError("Gemm 期望 rank-2 输入");
+  }
+  const bool trans_b = GetIntAttribute(node, "transB", 0) != 0;
+  const int64_t n = trans_b ? b->tensor.shape[0] : b->tensor.shape[1];
+  TensorDesc desc({a->tensor.shape[0], n}, a->tensor.dtype,
+                  a->tensor.device_type, a->tensor.device_id, "");
+  CUTRITON_RETURN_IF_ERROR(desc.Validate());
+  return graph->SetValueDesc(node.outputs()[0], std::move(desc));
+}
+
+Status InferGlobalAveragePool(Graph* graph, const Node& node) {
+  const auto* input = graph->FindValue(node.inputs().front());
+  if (input == nullptr || input->tensor.shape.size() != 4) {
+    return Status::ShapeError("GlobalAveragePool 期望 NCHW 输入");
+  }
+  TensorDesc desc({input->tensor.shape[0], input->tensor.shape[1], 1, 1},
+                  input->tensor.dtype, input->tensor.device_type,
+                  input->tensor.device_id, input->tensor.layout);
+  return graph->SetValueDesc(node.outputs()[0], std::move(desc));
+}
+
+class TopologicalSortPass final : public GraphPass {
+ public:
+  const char* name() const override { return "topological_sort"; }
+  Status Run(Graph* graph) const override { return graph->TopologicalSort(); }
+};
+
+class ShapeInferencePass final : public GraphPass {
+ public:
+  const char* name() const override { return "shape_inference"; }
+
+  Status Run(Graph* graph) const override {
+    for (const auto& node : graph->nodes()) {
+      if (node.op_type() == "Conv" ||
+          node.op_type() == "FusedConvBatchNormRelu") {
+        CUTRITON_RETURN_IF_ERROR(InferConvLike(graph, node));
+      } else if (node.op_type() == "BatchNormalization" ||
+                 node.op_type() == "Relu" || node.op_type() == "Gelu" ||
+                 node.op_type() == "Softmax" ||
+                 node.op_type() == "LayerNormalization" ||
+                 node.op_type() == "Add") {
+        CUTRITON_RETURN_IF_ERROR(SetOutputLikeInput(graph, node));
+      } else if (node.op_type() == "Flatten") {
+        CUTRITON_RETURN_IF_ERROR(InferFlatten(graph, node));
+      } else if (node.op_type() == "Gemm" || node.op_type() == "MatMul") {
+        CUTRITON_RETURN_IF_ERROR(InferGemm(graph, node));
+      } else if (node.op_type() == "MaxPool" ||
+                 node.op_type() == "AveragePool") {
+        CUTRITON_RETURN_IF_ERROR(InferPool(graph, node));
+      } else if (node.op_type() == "GlobalAveragePool") {
+        CUTRITON_RETURN_IF_ERROR(InferGlobalAveragePool(graph, node));
+      } else if (node.op_type() == "Constant") {
+        continue;
+      } else {
+        return Status::Unsupported("形状推导暂不支持算子: " +
+                                   node.op_type());
+      }
+    }
+    return Status::OK();
+  }
+};
+
+class ConstantFoldingPass final : public GraphPass {
+ public:
+  const char* name() const override { return "constant_folding"; }
+  Status Run(Graph*) const override {
+    // V1 只在图边界跟踪常量 Value，不持有真实权重数据。
+    // 保留这个 Pass 是为了后续加入带数据的常量折叠时，不需要改变编译流水线。
+    return Status::OK();
+  }
+};
+
+//如果一个节点的输出最终能够影响 Graph 的输出，这个节点就保留；否则删除
+class DeadNodeEliminationPass final : public GraphPass {
+ public:
+  const char* name() const override { return "dead_node_elimination"; }
+
+  Status Run(Graph* graph) const override {
+    std::unordered_set<std::string> live_values(graph->outputs().begin(),
+                                                graph->outputs().end());
+    std::unordered_set<int> live_nodes;
+    const auto& nodes = graph->nodes();
+    //从后往前遍历
+    for (auto it = nodes.rbegin(); it != nodes.rend(); ++it) {
+      bool needed = false;
+      for (const auto& output : it->outputs()) {
+        if (live_values.find(output) != live_values.end()) {
+          needed = true;//需要
+          break;
+        }
+      }
+      if (!needed) {
+        continue;
+      }
+      live_nodes.insert(it->id());
+      for (const auto& input : it->inputs()) {
+        live_values.insert(input);
+      }
+    }
+
+    std::vector<int> remove;
+    //删除
+    for (const auto& node : graph->nodes()) {
+      if (live_nodes.find(node.id()) == live_nodes.end()) {
+        remove.push_back(node.id());
+      }
+    }
+    return graph->RemoveNodes(remove);
+  }
+};
+
+class ConvBatchNormReluFusionPass final : public GraphPass {
+ public:
+  const char* name() const override { return "conv_batchnorm_relu_fusion"; }
+
+  Status Run(Graph* graph) const override {
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      const auto consumers = graph->BuildConsumerMap();
+      int bn_id = -1;
+      int relu_id = -1;
+      for (auto& conv : graph->mutable_nodes()) {
+        if (conv.op_type() != "Conv" || conv.outputs().size() != 1) {
+          continue;
+        }
+        auto conv_consumers_it = consumers.find(conv.outputs()[0]);
+        if (conv_consumers_it == consumers.end() ||
+            conv_consumers_it->second.size() != 1) {
+          continue;
+        }
+        bn_id = conv_consumers_it->second.front();
+        if (bn_id < 0 || bn_id >= static_cast<int>(graph->nodes().size())) {
+          continue;
+        }
+        const Node& bn = graph->nodes()[bn_id];
+        if (bn.op_type() != "BatchNormalization" || bn.outputs().size() != 1) {
+          continue;
+        }
+        auto bn_consumers_it = consumers.find(bn.outputs()[0]);
+        if (bn_consumers_it == consumers.end() ||
+            bn_consumers_it->second.size() != 1) {
+          continue;
+        }
+        relu_id = bn_consumers_it->second.front();
+        const Node& relu = graph->nodes()[relu_id];
+        if (relu.op_type() != "Relu" || relu.outputs().empty()) {
+          continue;
+        }
+
+        std::vector<std::string> fused_inputs = conv.inputs();
+        for (std::size_t i = 1; i < bn.inputs().size(); ++i) {
+          fused_inputs.push_back(bn.inputs()[i]);
+        }
+        conv.set_name(conv.name() + "_bn_relu");
+        conv.set_op_type("FusedConvBatchNormRelu");
+        conv.set_inputs(std::move(fused_inputs));
+        conv.set_outputs(relu.outputs());
+        conv.SetAttribute("fused_batchnorm_relu", true);
+        CUTRITON_RETURN_IF_ERROR(graph->RemoveNodes({bn_id, relu_id}));
+        changed = true;
+        break;
+      }
+    }
+    return Status::OK();
+  }
+};
+
+class FlattenGemmNormalizationPass final : public GraphPass {
+ public:
+  const char* name() const override { return "flatten_gemm_normalization"; }
+
+  Status Run(Graph* graph) const override {
+    for (auto& node : graph->mutable_nodes()) {
+      if (node.op_type() == "MatMul") {
+        node.set_op_type("Gemm");
+        node.SetAttribute("normalized_from_matmul", true);
+      }
+      if (node.op_type() == "Flatten" &&
+          !node.GetAttribute<int64_t>("axis").has_value()) {
+        node.SetAttribute("axis", static_cast<int64_t>(1));
+      }
+    }
+    return Status::OK();
+  }
+};
+
+class StaticShapeValidationPass final : public GraphPass {
+ public:
+  const char* name() const override { return "static_shape_validation"; }
+
+  Status Run(Graph* graph) const override {
+    for (const auto& [name, value] : graph->values()) {
+      if (value.tensor.dtype == DataType::kUnknown && !value.is_constant) {
+        continue;
+      }
+      if (!value.tensor.shape.empty()) {
+        CUTRITON_RETURN_IF_ERROR(value.tensor.Validate());
+      }
+      (void)name;
+    }
+    for (const auto& output : graph->outputs()) {
+      const auto* value = graph->FindValue(output);
+      if (value == nullptr) {
+        return Status::NotFound("图输出丢失: " + output);
+      }
+      CUTRITON_RETURN_IF_ERROR(value->tensor.Validate());
+    }
+    return Status::OK();
+  }
+};
+
+}  // 匿名命名空间
+
+void PassManager::Add(std::unique_ptr<GraphPass> pass) {
+  passes_.push_back(std::move(pass));
+}
+
+Status PassManager::Run(Graph* graph) const {
+  executed_passes_.clear();
+  for (const auto& pass : passes_) {
+    CUTRITON_RETURN_IF_ERROR(pass->Run(graph));
+    executed_passes_.push_back(pass->name());
+  }
+  return Status::OK();
+}
+
+std::unique_ptr<GraphPass> CreateTopologicalSortPass() {
+  return std::make_unique<TopologicalSortPass>();
+}
+
+std::unique_ptr<GraphPass> CreateShapeInferencePass() {
+  return std::make_unique<ShapeInferencePass>();
+}
+
+std::unique_ptr<GraphPass> CreateConstantFoldingPass() {
+  return std::make_unique<ConstantFoldingPass>();
+}
+
+std::unique_ptr<GraphPass> CreateDeadNodeEliminationPass() {
+  return std::make_unique<DeadNodeEliminationPass>();
+}
+
+std::unique_ptr<GraphPass> CreateConvBatchNormReluFusionPass() {
+  return std::make_unique<ConvBatchNormReluFusionPass>();
+}
+
+std::unique_ptr<GraphPass> CreateFlattenGemmNormalizationPass() {
+  return std::make_unique<FlattenGemmNormalizationPass>();
+}
+
+std::unique_ptr<GraphPass> CreateStaticShapeValidationPass() {
+  return std::make_unique<StaticShapeValidationPass>();
+}
+
+PassManager CreateDefaultCompilePasses() {
+  PassManager manager;
+  manager.Add(CreateTopologicalSortPass());
+  manager.Add(CreateShapeInferencePass());
+  manager.Add(CreateConstantFoldingPass());
+  manager.Add(CreateDeadNodeEliminationPass());
+  manager.Add(CreateConvBatchNormReluFusionPass());
+  manager.Add(CreateTopologicalSortPass());
+  manager.Add(CreateShapeInferencePass());
+  manager.Add(CreateFlattenGemmNormalizationPass());
+  manager.Add(CreateDeadNodeEliminationPass());
+  manager.Add(CreateStaticShapeValidationPass());
+  return manager;
+}
+
+}  // 命名空间 cutriton
