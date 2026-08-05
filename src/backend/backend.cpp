@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <regex>
 #include <sstream>
@@ -347,8 +348,13 @@ class CudaTritonKernel final : public OpKernel {
     CUTRITON_RETURN_IF_ERROR(SetDevice(device_id_, &cuda_context, &device));
     const auto& node = *context->node;
     Status status;
-    if (op_type_ == "FusedConvBatchNormRelu") {
+    if (op_type_ == "FusedConvBatchNormRelu" ||
+        op_type_ == "FusedConvBatchNorm") {
       status = LaunchFused(node, context);
+    } else if (op_type_ == "MaxPool") {
+      status = LaunchMaxPool(node, context);
+    } else if (op_type_ == "AddRelu") {
+      status = LaunchAddRelu(node, context);
     } else if (op_type_ == "GlobalAveragePool") {
       status = LaunchGlobalAveragePool(node, context);
     } else if (op_type_ == "Gemm") {
@@ -392,7 +398,7 @@ class CudaTritonKernel final : public OpKernel {
   Status LaunchFused(const Node& node, KernelContext* context) {
     if (node.inputs().size() != 6 || node.outputs().size() != 1) {
       return Status::InvalidArgument(
-          "FusedConvBatchNormRelu expects 6 inputs and 1 output");
+          op_type_ + " expects 6 inputs and 1 output");
     }
     auto x = TensorPointer(TensorAt(context, node.inputs()[0]));
     auto w = TensorPointer(TensorAt(context, node.inputs()[1]));
@@ -442,8 +448,71 @@ class CudaTritonKernel final : public OpKernel {
     int h = static_cast<int>(dims[2]);
     int w = static_cast<int>(dims[3]);
     std::vector<void*> args{&x, &y, &n, &c, &h, &w};
+    const auto count = static_cast<unsigned int>(n * c);
     return Launch(reinterpret_cast<CUstream>(context->stream),
-                  static_cast<unsigned int>(n * c), std::move(args));
+                  (count + 255U) / 256U, std::move(args));
+  }
+
+  Status LaunchMaxPool(const Node& node, KernelContext* context) {
+    if (node.inputs().size() != 1 || node.outputs().size() != 1) {
+      return Status::InvalidArgument("MaxPool expects 1 input and 1 output");
+    }
+    auto x = TensorPointer(TensorAt(context, node.inputs()[0]));
+    auto y = TensorPointer(TensorAt(context, node.outputs()[0]));
+    const auto& xd = TensorAt(context, node.inputs()[0]).desc().shape;
+    const auto& yd = TensorAt(context, node.outputs()[0]).desc().shape;
+    int n = static_cast<int>(xd[0]);
+    int c = static_cast<int>(xd[1]);
+    int h = static_cast<int>(xd[2]);
+    int w = static_cast<int>(xd[3]);
+    int oh = static_cast<int>(yd[2]);
+    int ow = static_cast<int>(yd[3]);
+    const auto kernel = GetIntListAttribute(node, "kernel_shape", {1, 1});
+    const auto strides = GetIntListAttribute(node, "strides", kernel);
+    const auto pads = GetIntListAttribute(node, "pads", {0, 0, 0, 0});
+    const auto dilations = GetIntListAttribute(node, "dilations", {1, 1});
+    if (kernel.size() != 2 || strides.size() != 2 || pads.size() != 4 ||
+        dilations.size() != 2) {
+      return Status::InvalidArgument(
+          "MaxPool attributes must be kernel_shape[2], strides[2], "
+          "pads[4], and dilations[2]");
+    }
+    int kernel_h = static_cast<int>(kernel[0]);
+    int kernel_w = static_cast<int>(kernel[1]);
+    int stride_h = static_cast<int>(strides[0]);
+    int stride_w = static_cast<int>(strides[1]);
+    int pad_h = static_cast<int>(pads[0]);
+    int pad_w = static_cast<int>(pads[1]);
+    int dilation_h = static_cast<int>(dilations[0]);
+    int dilation_w = static_cast<int>(dilations[1]);
+    std::vector<void*> args{
+        &x,         &y,          &n,          &c,         &h,
+        &w,         &oh,         &ow,         &kernel_h,  &kernel_w,
+        &stride_h,  &stride_w,   &pad_h,      &pad_w,     &dilation_h,
+        &dilation_w};
+    const auto count = static_cast<unsigned int>(n * c * oh * ow);
+    return Launch(reinterpret_cast<CUstream>(context->stream),
+                  (count + 255U) / 256U, std::move(args));
+  }
+
+  Status LaunchAddRelu(const Node& node, KernelContext* context) {
+    if (node.inputs().size() != 2 || node.outputs().size() != 1) {
+      return Status::InvalidArgument("AddRelu expects 2 inputs and 1 output");
+    }
+    auto a = TensorPointer(TensorAt(context, node.inputs()[0]));
+    auto b = TensorPointer(TensorAt(context, node.inputs()[1]));
+    auto y = TensorPointer(TensorAt(context, node.outputs()[0]));
+    const auto elements =
+        TensorAt(context, node.outputs()[0]).desc().NumElements();
+    if (elements <= 0 ||
+        elements > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+      return Status::InvalidArgument("AddRelu element count is invalid");
+    }
+    int total = static_cast<int>(elements);
+    std::vector<void*> args{&a, &b, &y, &total};
+    const auto count = static_cast<unsigned int>(total);
+    return Launch(reinterpret_cast<CUstream>(context->stream),
+                  (count + 255U) / 256U, std::move(args));
   }
 
   Status LaunchGemm(const Node& node, KernelContext* context) {
@@ -456,8 +525,9 @@ class CudaTritonKernel final : public OpKernel {
     int k = static_cast<int>(ad[1]);
     int n = static_cast<int>(bd[1]);
     std::vector<void*> args{&a, &b, &y, &m, &n, &k};
+    const auto count = static_cast<unsigned int>(m * n);
     return Launch(reinterpret_cast<CUstream>(context->stream),
-                  static_cast<unsigned int>(m * n), std::move(args));
+                  (count + 255U) / 256U, std::move(args));
   }
 
   std::string op_type_;
@@ -485,20 +555,46 @@ class CudaTritonBackend final : public Backend {
       return Status::Unsupported("cuda_triton requires a CUDA device");
     }
     if (node.op_type() != "FusedConvBatchNormRelu" &&
-        node.op_type() != "GlobalAveragePool" && node.op_type() != "Flatten" &&
-        node.op_type() != "Gemm") {
+        node.op_type() != "FusedConvBatchNorm" &&
+        node.op_type() != "GlobalAveragePool" &&
+        node.op_type() != "MaxPool" && node.op_type() != "AddRelu" &&
+        node.op_type() != "Flatten" && node.op_type() != "Gemm") {
       return Status::Unsupported("no FP32 Triton factory for " +
                                  node.op_type());
     }
+    if ((node.op_type() == "FusedConvBatchNormRelu" ||
+         node.op_type() == "FusedConvBatchNorm") &&
+        (node.inputs().size() != 6 || node.outputs().size() != 1)) {
+      return Status::Unsupported(node.op_type() +
+                                 " requires 6 inputs and 1 output");
+    }
+    if ((node.op_type() == "GlobalAveragePool" ||
+         node.op_type() == "MaxPool" || node.op_type() == "Flatten") &&
+        (node.inputs().size() != 1 || node.outputs().size() != 1)) {
+      return Status::Unsupported(node.op_type() +
+                                 " requires 1 input and 1 output");
+    }
+    if ((node.op_type() == "AddRelu" || node.op_type() == "Gemm") &&
+        (node.inputs().size() != 2 || node.outputs().size() != 1)) {
+      return Status::Unsupported(node.op_type() +
+                                 " requires 2 inputs and 1 output");
+    }
+    if (node.op_type() == "Gemm" && GetIntAttribute(node, "transB", 0) != 0) {
+      return Status::Unsupported("the FP32 Gemm kernel does not support transB");
+    }
     const std::string layout =
         (node.op_type() == "FusedConvBatchNormRelu" ||
-         node.op_type() == "GlobalAveragePool")
+         node.op_type() == "FusedConvBatchNorm" ||
+         node.op_type() == "GlobalAveragePool" ||
+         node.op_type() == "MaxPool" || node.op_type() == "AddRelu")
             ? "NCHW"
             : "";
-    for (const auto& input : node.inputs()) {
+    for (std::size_t index = 0; index < node.inputs().size(); ++index) {
+      const auto& input = node.inputs()[index];
+      const bool activation_input = index == 0 || node.op_type() == "AddRelu";
       CUTRITON_RETURN_IF_ERROR(CheckTensor(
           graph, input, DeviceType::kCUDA, options.device.id,
-          input == node.inputs().front() ? layout : ""));
+          activation_input ? layout : ""));
     }
     for (const auto& output : node.outputs()) {
       CUTRITON_RETURN_IF_ERROR(CheckTensor(

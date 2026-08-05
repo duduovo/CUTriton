@@ -15,8 +15,9 @@
 
 ## 当前内置后端
 
-- `cuda_triton`：支持 FP32 `FusedConvBatchNormRelu`、
-  `GlobalAveragePool`、`Gemm`，并把 `Flatten` 实现为零拷贝 view。
+- `cuda_triton`：支持 FP32 `FusedConvBatchNorm`、`FusedConvBatchNormRelu`、
+  `MaxPool`、`AddRelu`、`GlobalAveragePool`、`Gemm`，并把 `Flatten` 实现为
+  零拷贝 view。这组算子可以覆盖 batch=1 的完整 ResNet-50。
 - `cpu_reference`：保留注册入口，但生产数值 Kernel 尚未实现，会明确返回
   `Unsupported`。
 

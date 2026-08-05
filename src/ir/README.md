@@ -11,11 +11,12 @@
 
 ## pass.cpp
 
-当前形状推导覆盖 Conv/融合 Conv、BatchNorm、激活、Add、Flatten、Gemm/MatMul、
-普通 Pool 和 GlobalAveragePool。默认流水线还包含 DCE、Conv+BN+ReLU 融合、
-Flatten/Gemm 规范化和静态 shape 校验。
+当前形状推导覆盖 Conv/融合 Conv、BatchNorm、激活、Add/AddRelu、Flatten、
+Gemm/MatMul、普通 Pool 和 GlobalAveragePool。默认流水线还包含 DCE、
+Conv+BN(+ReLU) 融合、Add+ReLU 融合、Flatten/Gemm 规范化和静态 shape 校验。
 
 融合 Pass 要求中间结果为单消费者，并把 BatchNorm 的 epsilon 保存为融合节点属性；
+没有紧随 ReLU 的 Conv+BN 会生成 `FusedConvBatchNorm`，残差末端会生成 `AddRelu`。
 Normalization Pass 将 MatMul 规范成 Gemm，并为缺省 Flatten axis 填入 1。
 
 `ConstantFoldingPass` 当前只保留流水线扩展位置，不执行带数据的常量计算。添加真实

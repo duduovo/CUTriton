@@ -2,9 +2,9 @@
 
 一个以 C++17 为核心、使用 Triton 生成 CUDA Kernel 的静态图推理引擎实验项目。
 
-CUTriton 把模型语义、图优化、后端能力检查、内存规划与运行时执行分成清晰的模块，
-当前首个可运行里程碑是：在单张 NVIDIA GPU 上真实执行 FP32 ResNet Stem 风格计算链，
-而不是用 NoOp Kernel 模拟成功。
+CUTriton 把模型语义、图优化、后端能力检查、内存规划与运行时执行分成清晰的模块。
+当前已经能在单张 NVIDIA GPU 上真实执行完整 FP32 ResNet-50（batch=1、NCHW、
+224×224、1000 类输出），而不是用 NoOp Kernel 模拟成功。
 
 > 项目状态：`0.1 / V1`。核心链路已经跑通并有真实 GPU 集成测试，但它仍是学习、研究
 > 和架构验证阶段的推理引擎，不是可直接替代 TensorRT 或 ONNX Runtime 的生产部署套件。
@@ -22,7 +22,7 @@ Compiler
   ├─ 复制 Graph，不修改原始 Model
   ├─ 拓扑排序与形状推导
   ├─ DCE 与算子规范化
-  ├─ Conv + BatchNorm + ReLU 融合
+  ├─ Conv + BatchNorm(+ReLU)、Add + ReLU 融合
   ├─ Backend::CheckSupport
   └─ Workspace / alias 内存规划
         |
@@ -47,18 +47,25 @@ ExecutionContext（每个并发任务独占）
   └─ CUDA Event profiling
 ```
 
-当前真实 GPU 测试执行如下链路：
+完整 ResNet-50 基准执行如下链路：
 
 ```text
 Input [1, 3, 224, 224]
-  -> FusedConvBatchNormRelu
+  -> Conv7x7 + BatchNorm + ReLU
+  -> MaxPool
+  -> layer1: Bottleneck x3
+  -> layer2: Bottleneck x4
+  -> layer3: Bottleneck x6
+  -> layer4: Bottleneck x3
   -> GlobalAveragePool
   -> Flatten（零拷贝 view）
   -> Gemm
   -> Output [1, 1000]
 ```
 
-输出会与 PyTorch FP32 参考实现按 `atol=1e-4`、`rtol=1e-4` 比较。
+每个 Bottleneck 都包含 1×1、3×3、1×1 三个卷积和残差 Add+ReLU；需要改变
+空间尺寸或通道数时还包含 1×1 投影支路。输出会与同权重的 PyTorch FP32 参考实现按
+`atol=1e-4`、`rtol=1e-4` 比较。
 
 ## 设计重点
 
@@ -86,8 +93,8 @@ Input [1, 3, 224, 224]
 | CUDA Buffer | 可用 | Driver API 显存分配、同步 H2D/D2H、外部 Buffer 包装 |
 | MemoryPlanner | 可用 | 静态 shape、256 B 对齐、best-fit、Flatten alias |
 | CUDA Runtime | 可用 | 内部/外部 Stream、异步提交、同步、Graph、Event |
-| Triton Kernel | 可用 | FP32 FusedConvBNReLU、GAP、Gemm；Flatten 为 view |
-| GPU 数值测试 | 通过 | ResNet Stem 风格链路与 PyTorch FP32 对齐 |
+| Triton Kernel | 可用 | FP32 FusedConvBN、FusedConvBNReLU、MaxPool、AddRelu、GAP、Gemm；Flatten 为 view |
+| GPU 数值测试 | 通过 | 完整 ResNet-50 与 PyTorch FP32 对齐 |
 | C++ CPU backend | 未完成 | `cpu_reference` 对真实计算明确返回 `Unsupported` |
 | Python API | 参考门面 | JSON/ONNX 结构读取和少量 Python 参考算子 |
 | 原生 ONNX importer | 未完成 | 尚未把 ONNX initializer/attribute 完整 lowering 到 C++ IR |
@@ -105,7 +112,33 @@ Input [1, 3, 224, 224]
 - CUDA 图中不允许 CPU 节点；跨设备 fallback 尚未实现。
 - GPU 输入输出必须已经位于同一目标 CUDA 设备，不自动插入 H2D/D2H 节点。
 - 没有动态 shape、FP16/TF32、自动调优、显存池和 `cudaMallocAsync`。
-- 当前测试链路是 ResNet Stem 风格子图，不是完整 ResNet-50。
+
+## ResNet-50 性能基准
+
+基准使用确定性合成权重，两个实现共享完全相同的输入、权重和 BatchNorm 参数。
+计时只包含 GPU 推理，使用 CUDA Event；CUTriton 测量 CUDA Graph replay，PyTorch
+测量 eager/cuDNN。当前机器在 5 次预热、20 次测量下的结果为：
+
+| 实现 | FP32 batch=1 延迟 | 相对 PyTorch |
+| --- | ---: | ---: |
+| PyTorch 2.11 eager / cuDNN | 3.2522 ms | 1.00× |
+| CUTriton / CUDA Graph | 39.6088 ms | 12.18× slower |
+| CUTriton（关闭 CUDA Graph） | 40.3838 ms | 12.42× slower |
+
+1000 维输出最大绝对误差为 `6.98e-9`。CUTriton 当前明显更慢，主要原因是卷积 Kernel
+仍按单个输出元素直接遍历 C×R×S，没有共享内存分块、矩阵化、Tensor Core、算子形状
+特化或自动调优；约 8 秒的首次 Engine 建立时间还包括为每个节点加载/创建 Kernel，
+也尚未实现模块缓存。这份结果是优化基线，不代表 Triton 的性能上限。
+
+复现实测：
+
+```bash
+cmake --build /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda --parallel \
+  --target cutriton_resnet50_benchmark
+python benchmarks/resnet50_compare.py \
+  --executable /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/cutriton_resnet50_benchmark \
+  --warmup 5 --iterations 20
+```
 
 ## 已验证环境
 
@@ -295,6 +328,9 @@ python benchmarks/plan_latency.py \
 ```text
 triton_kernels/
   ├─ FusedConvBatchNormRelu.ptx
+  ├─ FusedConvBatchNorm.ptx
+  ├─ MaxPool.ptx
+  ├─ AddRelu.ptx
   ├─ GlobalAveragePool.ptx
   ├─ Gemm.ptx
   └─ manifest.json
@@ -326,11 +362,12 @@ Triton 3.6 会在用户参数后追加两个运行时指针参数；生成器和
 
 - 缺失 Triton 产物和 SM 不兼容时编译失败。
 - 常量权重上传和 CUDA Workspace 实际接线。
-- 三个真实 Triton Kernel 与 Flatten view。
+- 六种真实 Triton Kernel 与 Flatten view。
 - CUDA Graph capture/replay 和重新绑定后重新捕获。
 - 内部 Stream 与外部 `CUstream`。
 - CUDA Event profiling。
-- ResNet Stem 风格输出与 PyTorch FP32 对齐。
+- ResNet Stem 集成测试与 PyTorch FP32 对齐。
+- 完整 ResNet-50 的独立 C++/PyTorch 正确性和性能基准。
 
 当前本机测试结果：
 
@@ -338,6 +375,7 @@ Triton 3.6 会在用户参数后追加两个运行时指针参数；生成器和
 cutriton_core_tests                 Passed
 cutriton_cuda_tests                 Passed
 cutriton_cuda_pytorch_reference     Passed
+cutriton_resnet50_pytorch_reference Passed
 tests/python                        1 passed
 ```
 
@@ -352,7 +390,7 @@ tests/python                        1 passed
 | [`tests/cpp/`](tests/cpp/) | CPU 架构测试与真实 CUDA 集成测试 |
 | [`tests/python/`](tests/python/) | Python API 与 PyTorch 数值参考测试 |
 | [`demo/`](demo/) | 最小 JSON IR 示例 |
-| [`benchmarks/`](benchmarks/) | benchmark 框架；当前主要覆盖 Python 参考路径 |
+| [`benchmarks/`](benchmarks/) | 完整 ResNet-50 C++ CUDA 基准、PyTorch 对照与轻量 Python 基准 |
 | [`docs/`](docs/) | 架构与开发文档 |
 
 公共模块入口：
@@ -382,12 +420,12 @@ tests/python                        1 passed
 1. 实现原生 ONNX importer，把 initializer 和属性完整映射到 C++ IR。
 2. 实现真实 C++ CPU reference Kernel，形成与 CUDA 后端独立的数值基线。
 3. 使用 pybind11 让 Python `Engine` 包装原生 C++ Engine。
-4. 扩展 FP16/TF32、更多 ResNet-50 算子和通用算子覆盖。
+4. 扩展 FP16/TF32、更多通用算子和模型覆盖。
 5. 加入 Kernel 自动调优、模块缓存、`cudaMallocAsync` 和显存池。
-6. 建立 PyTorch Eager、ONNX Runtime CUDA 与 CUTriton 的可复现性能报告。
+6. 扩展当前 PyTorch Eager 对照，加入 ONNX Runtime CUDA 和 TensorRT 报告。
 7. 增加安装规则、CMake package export、Python wheel 和稳定的动态库导出宏。
 
-在可复现 benchmark 产出前，项目不会宣称固定性能提升比例。
+性能数字依赖 GPU、驱动、温度和软件版本；上表保留环境与命令，不宣称固定性能比例。
 
 ## 常见问题
 

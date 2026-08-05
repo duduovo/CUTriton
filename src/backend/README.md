@@ -12,6 +12,9 @@
 CUDA 后端当前支持静态 FP32、单设备和以下节点：
 
 - `FusedConvBatchNormRelu`：NCHW/OIHW，使用 stride、pad、dilation 和 epsilon。
+- `FusedConvBatchNorm`：残差分支末端使用的不带 ReLU 融合卷积。
+- `MaxPool`：NCHW 二维最大池化，支持 kernel、stride、pad 和 dilation。
+- `AddRelu`：等形状残差逐元素相加并执行 ReLU。
 - `GlobalAveragePool`：NCHW 全局空间平均。
 - `Gemm`：二维 FP32 矩阵乘法。
 - `Flatten`：不启动 Kernel，创建零拷贝 Tensor view。

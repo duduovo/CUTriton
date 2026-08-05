@@ -46,6 +46,8 @@ std::unique_ptr<GraphPass> CreateConstantFoldingPass();
 std::unique_ptr<GraphPass> CreateDeadNodeEliminationPass();
 //把连续的 Conv、BatchNormalization、ReLU 合并成一个节点
 std::unique_ptr<GraphPass> CreateConvBatchNormReluFusionPass();
+//把残差分支末尾的 Add、Relu 合并成一个节点
+std::unique_ptr<GraphPass> CreateAddReluFusionPass();
 //把多种相似写法转换成项目内部统一的写法
 std::unique_ptr<GraphPass> CreateFlattenGemmNormalizationPass();
 //检查最终 Tensor 描述是否合法

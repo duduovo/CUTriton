@@ -41,6 +41,25 @@ Status SetOutputLikeInput(Graph* graph, const Node& node) {
   return Status::OK();
 }
 
+Status InferElementwiseBinary(Graph* graph, const Node& node) {
+  if (node.inputs().size() != 2 || node.outputs().size() != 1) {
+    return Status::ShapeError(node.op_type() +
+                              " expects two inputs and one output");
+  }
+  const auto* first = graph->FindValue(node.inputs()[0]);
+  const auto* second = graph->FindValue(node.inputs()[1]);
+  if (first == nullptr || second == nullptr) {
+    return Status::ShapeError(node.op_type() + " references an unknown Tensor");
+  }
+  if (first->tensor.shape != second->tensor.shape ||
+      first->tensor.dtype != second->tensor.dtype ||
+      first->tensor.layout != second->tensor.layout) {
+    return Status::ShapeError(node.op_type() +
+                              " inputs must have identical descriptions");
+  }
+  return graph->SetValueDesc(node.outputs()[0], first->tensor);
+}
+
 Status InferConvLike(Graph* graph, const Node& node) {
   if (node.inputs().size() < 2 || node.outputs().empty()) {
     return Status::ShapeError("Conv 类节点需要输入、权重和输出");
@@ -88,12 +107,19 @@ Status InferPool(Graph* graph, const Node& node) {
   const auto kernel = GetIntListAttribute(node, "kernel_shape", {1, 1});
   const auto strides = GetIntListAttribute(node, "strides", kernel);
   const auto pads = GetIntListAttribute(node, "pads", {0, 0, 0, 0});
-  if (kernel.size() != 2 || strides.size() != 2 || pads.size() != 4) {
-    return Status::ShapeError("Pool 属性必须是 kernel_shape[2]、strides[2]、pads[4]");
+  const auto dilations = GetIntListAttribute(node, "dilations", {1, 1});
+  if (kernel.size() != 2 || strides.size() != 2 || pads.size() != 4 ||
+      dilations.size() != 2) {
+    return Status::ShapeError(
+        "Pool 属性必须是 kernel_shape[2]、strides[2]、pads[4]、dilations[2]");
   }
   const auto& shape = input->tensor.shape;
-  const int64_t out_h = (shape[2] + pads[0] + pads[2] - kernel[0]) / strides[0] + 1;
-  const int64_t out_w = (shape[3] + pads[1] + pads[3] - kernel[1]) / strides[1] + 1;
+  const int64_t effective_h = dilations[0] * (kernel[0] - 1) + 1;
+  const int64_t effective_w = dilations[1] * (kernel[1] - 1) + 1;
+  const int64_t out_h =
+      (shape[2] + pads[0] + pads[2] - effective_h) / strides[0] + 1;
+  const int64_t out_w =
+      (shape[3] + pads[1] + pads[3] - effective_w) / strides[1] + 1;
   TensorDesc desc({shape[0], shape[1], out_h, out_w}, input->tensor.dtype,
                   input->tensor.device_type, input->tensor.device_id,
                   input->tensor.layout);
@@ -164,14 +190,16 @@ class ShapeInferencePass final : public GraphPass {
   Status Run(Graph* graph) const override {
     for (const auto& node : graph->nodes()) {
       if (node.op_type() == "Conv" ||
+          node.op_type() == "FusedConvBatchNorm" ||
           node.op_type() == "FusedConvBatchNormRelu") {
         CUTRITON_RETURN_IF_ERROR(InferConvLike(graph, node));
       } else if (node.op_type() == "BatchNormalization" ||
                  node.op_type() == "Relu" || node.op_type() == "Gelu" ||
                  node.op_type() == "Softmax" ||
-                 node.op_type() == "LayerNormalization" ||
-                 node.op_type() == "Add") {
+                 node.op_type() == "LayerNormalization") {
         CUTRITON_RETURN_IF_ERROR(SetOutputLikeInput(graph, node));
+      } else if (node.op_type() == "Add" || node.op_type() == "AddRelu") {
+        CUTRITON_RETURN_IF_ERROR(InferElementwiseBinary(graph, node));
       } else if (node.op_type() == "Flatten") {
         CUTRITON_RETURN_IF_ERROR(InferFlatten(graph, node));
       } else if (node.op_type() == "Gemm" || node.op_type() == "MatMul") {
@@ -269,29 +297,74 @@ class ConvBatchNormReluFusionPass final : public GraphPass {
         if (bn.op_type() != "BatchNormalization" || bn.outputs().size() != 1) {
           continue;
         }
+        bool fuse_relu = false;
         auto bn_consumers_it = consumers.find(bn.outputs()[0]);
-        if (bn_consumers_it == consumers.end() ||
-            bn_consumers_it->second.size() != 1) {
-          continue;
-        }
-        relu_id = bn_consumers_it->second.front();
-        const Node& relu = graph->nodes()[relu_id];
-        if (relu.op_type() != "Relu" || relu.outputs().empty()) {
-          continue;
+        if (bn_consumers_it != consumers.end() &&
+            bn_consumers_it->second.size() == 1) {
+          relu_id = bn_consumers_it->second.front();
+          if (relu_id >= 0 &&
+              relu_id < static_cast<int>(graph->nodes().size())) {
+            const Node& relu = graph->nodes()[relu_id];
+            fuse_relu = relu.op_type() == "Relu" && !relu.outputs().empty();
+          }
         }
 
         std::vector<std::string> fused_inputs = conv.inputs();
         for (std::size_t i = 1; i < bn.inputs().size(); ++i) {
           fused_inputs.push_back(bn.inputs()[i]);
         }
-        conv.set_name(conv.name() + "_bn_relu");
-        conv.set_op_type("FusedConvBatchNormRelu");
+        conv.set_name(conv.name() + (fuse_relu ? "_bn_relu" : "_bn"));
+        conv.set_op_type(fuse_relu ? "FusedConvBatchNormRelu"
+                                   : "FusedConvBatchNorm");
         conv.set_inputs(std::move(fused_inputs));
-        conv.set_outputs(relu.outputs());
-        conv.SetAttribute("fused_batchnorm_relu", true);
+        conv.set_outputs(fuse_relu ? graph->nodes()[relu_id].outputs()
+                                   : bn.outputs());
+        conv.SetAttribute("fused_batchnorm_relu", fuse_relu);
         conv.SetAttribute("batchnorm_epsilon",
                           bn.GetAttribute<double>("epsilon").value_or(1e-5));
-        CUTRITON_RETURN_IF_ERROR(graph->RemoveNodes({bn_id, relu_id}));
+        std::vector<int> remove{bn_id};
+        if (fuse_relu) {
+          remove.push_back(relu_id);
+        }
+        CUTRITON_RETURN_IF_ERROR(graph->RemoveNodes(remove));
+        changed = true;
+        break;
+      }
+    }
+    return Status::OK();
+  }
+};
+
+class AddReluFusionPass final : public GraphPass {
+ public:
+  const char* name() const override { return "add_relu_fusion"; }
+
+  Status Run(Graph* graph) const override {
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      const auto consumers = graph->BuildConsumerMap();
+      for (auto& add : graph->mutable_nodes()) {
+        if (add.op_type() != "Add" || add.outputs().size() != 1) {
+          continue;
+        }
+        const auto it = consumers.find(add.outputs()[0]);
+        if (it == consumers.end() || it->second.size() != 1) {
+          continue;
+        }
+        const int relu_id = it->second.front();
+        if (relu_id < 0 ||
+            relu_id >= static_cast<int>(graph->nodes().size())) {
+          continue;
+        }
+        const Node& relu = graph->nodes()[relu_id];
+        if (relu.op_type() != "Relu" || relu.outputs().size() != 1) {
+          continue;
+        }
+        add.set_name(add.name() + "_relu");
+        add.set_op_type("AddRelu");
+        add.set_outputs(relu.outputs());
+        CUTRITON_RETURN_IF_ERROR(graph->RemoveNodes({relu_id}));
         changed = true;
         break;
       }
@@ -379,6 +452,10 @@ std::unique_ptr<GraphPass> CreateConvBatchNormReluFusionPass() {
   return std::make_unique<ConvBatchNormReluFusionPass>();
 }
 
+std::unique_ptr<GraphPass> CreateAddReluFusionPass() {
+  return std::make_unique<AddReluFusionPass>();
+}
+
 std::unique_ptr<GraphPass> CreateFlattenGemmNormalizationPass() {
   return std::make_unique<FlattenGemmNormalizationPass>();
 }
@@ -394,6 +471,7 @@ PassManager CreateDefaultCompilePasses() {
   manager.Add(CreateConstantFoldingPass());
   manager.Add(CreateDeadNodeEliminationPass());
   manager.Add(CreateConvBatchNormReluFusionPass());
+  manager.Add(CreateAddReluFusionPass());
   manager.Add(CreateTopologicalSortPass());
   manager.Add(CreateShapeInferencePass());
   manager.Add(CreateFlattenGemmNormalizationPass());
