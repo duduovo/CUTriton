@@ -1,4 +1,5 @@
 #include "cutriton/ir/graph.h"
+#include "cutriton/core/buffer.h"
 
 #include <algorithm>
 #include <queue>
@@ -192,6 +193,39 @@ int64_t GetIntAttribute(const Node& node, const std::string& key,
     return *value;
   }
   return fallback;
+}
+
+Status Model::AddConstant(std::string name, Tensor tensor) {
+  if (name.empty()) {
+    return Status::InvalidArgument("Constant name must not be empty");
+  }
+  CUTRITON_RETURN_IF_ERROR(tensor.desc().Validate());
+  if (!tensor.defined() || tensor.buffer()->empty()) {
+    return Status::InvalidArgument("Constant Tensor must have a Buffer: " + name);
+  }
+  if (tensor.buffer()->device_type() != DeviceType::kCPU ||
+      tensor.desc().device_type != DeviceType::kCPU) {
+    return Status::InvalidArgument("Model constants must use host memory: " + name);
+  }
+  if (tensor.byte_offset() > tensor.buffer()->size_bytes() ||
+      tensor.desc().ByteSize() > tensor.buffer()->size_bytes() - tensor.byte_offset()) {
+    return Status::InvalidArgument("Constant Buffer is too small: " + name);
+  }
+  if (constants_.find(name) != constants_.end()) {
+    return Status::AlreadyExists("Constant already exists: " + name);
+  }
+  if (const auto* existing = graph_.FindValue(name); existing != nullptr) {
+    if (existing->is_constant) {
+      return Status::AlreadyExists("Constant already exists: " + name);
+    }
+    CUTRITON_RETURN_IF_ERROR(graph_.SetValueDesc(name, tensor.desc()));
+    graph_.MutableValue(name)->is_constant = true;
+  } else {
+    CUTRITON_RETURN_IF_ERROR(
+        graph_.AddValue(ValueDesc{name, tensor.desc(), true}));
+  }
+  constants_.emplace(std::move(name), std::move(tensor));
+  return Status::OK();
 }
 
 }  // 命名空间 cutriton

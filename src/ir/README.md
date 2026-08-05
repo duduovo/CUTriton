@@ -1,22 +1,22 @@
 # src/ir
 
-本目录实现 CUTriton 的计算图和图优化 Pass。
+本目录实现 Graph 数据结构、Model 常量和编译前图优化。
 
-这里是模型语义被规范化和优化的地方，决定进入后端选择前的图长什么样。
+## graph.cpp
 
-## 与其他目录的关系
+- 校验并添加 Value、输入、输出和 Node。
+- 管理节点编号、拓扑排序、节点删除及 producer/consumer map。
+- `Model::AddConstant()` 校验 Host Buffer、静态 shape 和描述/Buffer 范围，并同时
+  更新 Graph 常量描述与 Model 常量表。
 
-- 实现 `include/cutriton/ir/` 中声明的 Graph 和 Pass API。
-- 使用 `src/core/` 的 TensorDesc 校验能力。
-- 被 `src/compiler/` 调用，作为编译流水线的一部分。
-- 编译后的图会进入 `src/runtime/` 的 ExecutablePlan 和 MemoryPlanner。
+## pass.cpp
 
-## 放什么
+当前形状推导覆盖 Conv/融合 Conv、BatchNorm、激活、Add、Flatten、Gemm/MatMul、
+普通 Pool 和 GlobalAveragePool。默认流水线还包含 DCE、Conv+BN+ReLU 融合、
+Flatten/Gemm 规范化和静态 shape 校验。
 
-- 图增删查改。
-- 拓扑排序。
-- 形状推导。
-- 死节点消除。
-- 算子融合和规范化 Pass。
-- 不放具体后端 Kernel。
+融合 Pass 要求中间结果为单消费者，并把 BatchNorm 的 epsilon 保存为融合节点属性；
+Normalization Pass 将 MatMul 规范成 Gemm，并为缺省 Flatten axis 填入 1。
 
+`ConstantFoldingPass` 当前只保留流水线扩展位置，不执行带数据的常量计算。添加真实
+折叠时，需要同步更新 Model/Plan 的常量 Tensor，而不能只标记 `ValueDesc`。

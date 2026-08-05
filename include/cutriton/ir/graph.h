@@ -141,9 +141,15 @@ class Model {
  public:
   Graph& graph() { return graph_; }
   const Graph& graph() const { return graph_; }
+  //增加常量
+  Status AddConstant(std::string name, Tensor tensor);
+  const std::unordered_map<std::string, Tensor>& constants() const {
+    return constants_;
+  }
 
  private:
   Graph graph_;
+  std::unordered_map<std::string, Tensor> constants_;//常量
 };
 //读取整数数组属性
 std::vector<int64_t> GetIntListAttribute(const Node& node,
