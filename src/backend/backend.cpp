@@ -374,6 +374,13 @@ class CudaTritonKernel final : public OpKernel {
 
   Status Launch(CUstream stream, unsigned int grid_x,
                 std::vector<void*> arguments) {
+    // Triton 3.6 emits two trailing pointer parameters for runtime/profile
+    // scratch storage. The current kernels do not use either allocation, but
+    // cuLaunchKernel still requires entries for the complete PTX ABI.
+    CUdeviceptr runtime_scratch{};
+    CUdeviceptr profile_scratch{};
+    arguments.push_back(&runtime_scratch);
+    arguments.push_back(&profile_scratch);
     return CudaStatus(
         cuLaunchKernel(function_, grid_x, 1, 1,
                        static_cast<unsigned int>(block_size_), 1, 1,

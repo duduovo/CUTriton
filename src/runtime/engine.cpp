@@ -409,6 +409,16 @@ Status ExecutionContext::RunAsync(void* stream) {
       stream == nullptr ? cuda->owned_stream : reinterpret_cast<CUstream>(stream);
 
   auto enqueue_sequence = [&]() -> Status {
+    auto record_event = [&](CUevent event) -> Status {
+      if (state_->plan.enable_cuda_graph()) {
+        return CudaStatus(
+            cuEventRecordWithFlags(event, cuda->active_stream,
+                                   CU_EVENT_RECORD_EXTERNAL),
+            "cuEventRecordWithFlags");
+      }
+      return CudaStatus(cuEventRecord(event, cuda->active_stream),
+                        "cuEventRecord");
+    };
     for (std::size_t i = 0; i < kernels_.size(); ++i) {
       const auto& op = state_->plan.ops()[i];
       const auto& node = state_->plan.graph().nodes().at(
@@ -417,14 +427,12 @@ Status ExecutionContext::RunAsync(void* stream) {
       events.timed = state_->plan.enable_profiling() &&
                      node.op_type() != "Flatten";
       if (events.timed) {
-        CUTRITON_RETURN_IF_ERROR(CudaStatus(
-            cuEventRecord(events.start, cuda->active_stream), "cuEventRecord"));
+        CUTRITON_RETURN_IF_ERROR(record_event(events.start));
       }
       KernelContext context{&node, &tensors_, cuda->active_stream, nullptr};
       CUTRITON_RETURN_IF_ERROR(kernels_[i]->Compute(&context));
       if (events.timed) {
-        CUTRITON_RETURN_IF_ERROR(CudaStatus(
-            cuEventRecord(events.end, cuda->active_stream), "cuEventRecord"));
+        CUTRITON_RETURN_IF_ERROR(record_event(events.end));
       }
     }
     return Status::OK();
