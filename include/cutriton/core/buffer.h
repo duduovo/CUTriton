@@ -15,10 +15,18 @@ class Buffer {
   Buffer() = default;
   //申请内存-->创建buffer对象-->记录地址和大小-->返回内存shared_ptr
   static std::shared_ptr<Buffer> AllocateHost(std::size_t size_bytes);
+  //申请CUDA内存
+  static Status AllocateCuda(std::size_t size_bytes, int device_id,
+                             std::shared_ptr<Buffer>* buffer);
   //不申请内存，将存在的内存数据包装为buffer，不负责释放内存，data存在周期比buffer长
   static std::shared_ptr<Buffer> WrapExternal(void* data, std::size_t size_bytes,
                                               DeviceType device_type,
                                               int device_id = 0);
+  //拷贝数据
+  Status CopyFromHost(const void* source, std::size_t size_bytes,
+                      std::size_t destination_offset = 0);
+  Status CopyToHost(void* destination, std::size_t size_bytes,
+                    std::size_t source_offset = 0) const;
 
   void* data() const { return data_; }
   std::size_t size_bytes() const { return size_bytes_; }

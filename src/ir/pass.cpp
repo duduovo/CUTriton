@@ -289,6 +289,8 @@ class ConvBatchNormReluFusionPass final : public GraphPass {
         conv.set_inputs(std::move(fused_inputs));
         conv.set_outputs(relu.outputs());
         conv.SetAttribute("fused_batchnorm_relu", true);
+        conv.SetAttribute("batchnorm_epsilon",
+                          bn.GetAttribute<double>("epsilon").value_or(1e-5));
         CUTRITON_RETURN_IF_ERROR(graph->RemoveNodes({bn_id, relu_id}));
         changed = true;
         break;

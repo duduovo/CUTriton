@@ -1,20 +1,26 @@
 # include/cutriton/ir
 
-本目录定义 CUTriton 的中间表示，也就是计算图和图 Pass 的公共接口。
+本目录定义 CUTriton 的中间表示和 Graph Pass 公共接口。IR 只描述“计算什么”，
+不决定由哪个后端执行，也不持有运行期 Stream 或 Workspace。
 
-IR 是模型导入、图优化、后端选择和内存规划之间的中心契约。
+## 图结构
 
-## 与其他目录的关系
+- `ValueDesc`：名称、`TensorDesc` 和 `is_constant` 标记。
+- `Node`：算子类型、输入输出名称及类型安全的 Attribute 表。
+- `Graph`：统一管理 Value、Node、图输入输出、拓扑关系和节点编号。
+- `Model`：持有 Graph 以及真实常量 Tensor 表。
 
-- 依赖 `include/cutriton/core/` 的 `TensorDesc` 和 `Status`。
-- 被 `include/cutriton/compiler/` 作为编译输入。
-- 被 `include/cutriton/backend/` 用来判断单个 `Node` 是否支持。
-- 被 `include/cutriton/runtime/` 的 `ExecutablePlan` 保存，供运行期按节点执行。
-- `src/ir/` 实现图操作和默认 Pass。
+`Model::AddConstant()` 只接受已定义、静态 shape 的 Host Tensor，并同步在 Graph 中
+建立 `is_constant=true` 的 Value。常量数据之后会复制进 `ExecutablePlan`，由
+Engine 在首次准备设备资源时上传。
 
-## 放什么
+## 默认 Pass 流水线
 
-- `Graph`、`Node`、`Model`、`ValueDesc`。
-- 节点 attribute 类型和读取辅助函数。
-- `GraphPass`、`PassManager` 和 Pass 创建函数。
+1. 拓扑排序和形状推导。
+2. 常量折叠扩展点与死节点消除。
+3. `Conv + BatchNormalization + Relu` 融合，并保留 BatchNorm epsilon。
+4. 再次拓扑排序、形状推导。
+5. Flatten/Gemm 规范化、再次 DCE 和静态 shape 校验。
 
+当前 `ConstantFoldingPass` 仍是扩展点，不计算新的常量数据；模型常量本身已经由
+`Model` 的常量表完整保存。具体实现位于 `src/ir/`。
