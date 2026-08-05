@@ -10,11 +10,15 @@ option(BUILD_SHARED_LIBS "Build CUTriton as shared libraries" OFF)
 
 add_library(cutriton
   src/backend/backend.cpp
+  src/backend/cuda_launcher.cpp
+  src/backend/kernel_artifact.cpp
   src/compiler/compiler.cpp
   src/core/buffer.cpp
   src/core/status.cpp
   src/core/tensor.cpp
   src/ir/graph.cpp
+  src/ir/fusion.cpp
+  src/ir/op_schema.cpp
   src/ir/pass.cpp
   src/runtime/engine.cpp
   src/runtime/memory_planner.cpp
@@ -44,27 +48,31 @@ if(CUTRITON_ENABLE_CUDA)
   find_package(CUDAToolkit REQUIRED)
   find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
   execute_process(
-    COMMAND ${Python3_EXECUTABLE} -c "import torch, triton; assert triton.__version__ == '3.6.0', triton.__version__"
+    COMMAND ${Python3_EXECUTABLE} -c "import triton; print(triton.__version__)"
     RESULT_VARIABLE CUTRITON_TRITON_CHECK
     ERROR_VARIABLE CUTRITON_TRITON_ERROR
   )
   if(NOT CUTRITON_TRITON_CHECK EQUAL 0)
-    message(FATAL_ERROR "CUTRITON_ENABLE_CUDA requires PyTorch and Triton 3.6.0: ${CUTRITON_TRITON_ERROR}")
+    message(FATAL_ERROR "CUTRITON_ENABLE_CUDA requires an importable Triton installation: ${CUTRITON_TRITON_ERROR}")
   endif()
   set(CUTRITON_KERNEL_ARTIFACT_DIR
       "${CMAKE_BINARY_DIR}/triton_kernels" CACHE PATH
       "Directory for generated Triton PTX and manifest")
   add_custom_command(
-    OUTPUT "${CUTRITON_KERNEL_ARTIFACT_DIR}/manifest.json"
+    OUTPUT "${CUTRITON_KERNEL_ARTIFACT_DIR}/pack.json"
     COMMAND ${Python3_EXECUTABLE}
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_triton_kernels.py"
             --output "${CUTRITON_KERNEL_ARTIFACT_DIR}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_triton_kernels.py"
+    DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_triton_kernels.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/python/cutriton/kernel_sdk/spec.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/python/cutriton/kernel_sdk/builder.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/python/cutriton/triton_kernels/resnet.py"
     COMMENT "Compiling CUTriton FP32 Triton kernels to PTX"
     VERBATIM
   )
   add_custom_target(cutriton_triton_kernels
-    DEPENDS "${CUTRITON_KERNEL_ARTIFACT_DIR}/manifest.json")
+    DEPENDS "${CUTRITON_KERNEL_ARTIFACT_DIR}/pack.json")
   add_dependencies(cutriton cutriton_triton_kernels)
   target_link_libraries(cutriton PRIVATE CUDA::cuda_driver)
   target_compile_definitions(cutriton PUBLIC CUTRITON_ENABLE_CUDA=1)

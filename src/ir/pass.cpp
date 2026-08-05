@@ -1,4 +1,5 @@
 #include "cutriton/ir/pass.h"
+#include "cutriton/ir/op_schema.h"
 
 #include <algorithm>
 #include <cmath>
@@ -188,33 +189,20 @@ class ShapeInferencePass final : public GraphPass {
   const char* name() const override { return "shape_inference"; }
 
   Status Run(Graph* graph) const override {
+    CUTRITON_RETURN_IF_ERROR(RegisterBuiltinOpSchemas());
     for (const auto& node : graph->nodes()) {
-      if (node.op_type() == "Conv" ||
-          node.op_type() == "FusedConvBatchNorm" ||
-          node.op_type() == "FusedConvBatchNormRelu") {
-        CUTRITON_RETURN_IF_ERROR(InferConvLike(graph, node));
-      } else if (node.op_type() == "BatchNormalization" ||
-                 node.op_type() == "Relu" || node.op_type() == "Gelu" ||
-                 node.op_type() == "Softmax" ||
-                 node.op_type() == "LayerNormalization") {
-        CUTRITON_RETURN_IF_ERROR(SetOutputLikeInput(graph, node));
-      } else if (node.op_type() == "Add" || node.op_type() == "AddRelu") {
-        CUTRITON_RETURN_IF_ERROR(InferElementwiseBinary(graph, node));
-      } else if (node.op_type() == "Flatten") {
-        CUTRITON_RETURN_IF_ERROR(InferFlatten(graph, node));
-      } else if (node.op_type() == "Gemm" || node.op_type() == "MatMul") {
-        CUTRITON_RETURN_IF_ERROR(InferGemm(graph, node));
-      } else if (node.op_type() == "MaxPool" ||
-                 node.op_type() == "AveragePool") {
-        CUTRITON_RETURN_IF_ERROR(InferPool(graph, node));
-      } else if (node.op_type() == "GlobalAveragePool") {
-        CUTRITON_RETURN_IF_ERROR(InferGlobalAveragePool(graph, node));
-      } else if (node.op_type() == "Constant") {
-        continue;
-      } else {
+      const auto schema = OpSchemaRegistry::Global().Find(node.op_type());
+      if (schema == nullptr) {
         return Status::Unsupported("形状推导暂不支持算子: " +
                                    node.op_type());
       }
+      if (node.inputs().size() < schema->min_inputs ||
+          node.inputs().size() > schema->max_inputs ||
+          node.outputs().size() != schema->outputs) {
+        return Status::ShapeError("节点输入输出数量不符合 OpSchema: " +
+                                  node.name());
+      }
+      CUTRITON_RETURN_IF_ERROR(schema->infer(graph, node));
     }
     return Status::OK();
   }
@@ -418,6 +406,59 @@ class StaticShapeValidationPass final : public GraphPass {
 };
 
 }  // 匿名命名空间
+
+Status RegisterBuiltinOpSchemas() {
+  auto& registry = OpSchemaRegistry::Global();
+  auto add = [&](OpSchema schema) -> Status {
+    const Status status = registry.Register(std::move(schema));
+    return status.code() == ErrorCode::kAlreadyExists ? Status::OK() : status;
+  };
+  const ShapeInferenceFunction same_as_input =
+      [](Graph* graph, const Node& node) {
+        return SetOutputLikeInput(graph, node);
+      };
+  const ShapeInferenceFunction conv = [](Graph* graph, const Node& node) {
+    return InferConvLike(graph, node);
+  };
+  CUTRITON_RETURN_IF_ERROR(add(OpSchema{"Conv", 2, 2, 1, conv}));
+  CUTRITON_RETURN_IF_ERROR(
+      add(OpSchema{"FusedConvBatchNorm", 6, 6, 1, conv}));
+  CUTRITON_RETURN_IF_ERROR(
+      add(OpSchema{"FusedConvBatchNormRelu", 6, 6, 1, conv}));
+  CUTRITON_RETURN_IF_ERROR(add(OpSchema{
+      "BatchNormalization", 5, 5, 1, same_as_input}));
+  for (const auto& op : {"Relu", "Gelu", "Softmax", "LayerNormalization"}) {
+    CUTRITON_RETURN_IF_ERROR(add(OpSchema{op, 1, 1, 1, same_as_input}));
+  }
+  const ShapeInferenceFunction binary =
+      [](Graph* graph, const Node& node) {
+        return InferElementwiseBinary(graph, node);
+      };
+  CUTRITON_RETURN_IF_ERROR(add(OpSchema{"Add", 2, 2, 1, binary}));
+  CUTRITON_RETURN_IF_ERROR(add(OpSchema{"AddRelu", 2, 2, 1, binary}));
+  CUTRITON_RETURN_IF_ERROR(add(OpSchema{
+      "Flatten", 1, 1, 1,
+      [](Graph* graph, const Node& node) { return InferFlatten(graph, node); }}));
+  const ShapeInferenceFunction gemm = [](Graph* graph, const Node& node) {
+    return InferGemm(graph, node);
+  };
+  CUTRITON_RETURN_IF_ERROR(add(OpSchema{"Gemm", 2, 3, 1, gemm}));
+  CUTRITON_RETURN_IF_ERROR(add(OpSchema{"MatMul", 2, 2, 1, gemm}));
+  const ShapeInferenceFunction pool = [](Graph* graph, const Node& node) {
+    return InferPool(graph, node);
+  };
+  CUTRITON_RETURN_IF_ERROR(add(OpSchema{"MaxPool", 1, 1, 1, pool}));
+  CUTRITON_RETURN_IF_ERROR(add(OpSchema{"AveragePool", 1, 1, 1, pool}));
+  CUTRITON_RETURN_IF_ERROR(add(OpSchema{
+      "GlobalAveragePool", 1, 1, 1,
+      [](Graph* graph, const Node& node) {
+        return InferGlobalAveragePool(graph, node);
+      }}));
+  CUTRITON_RETURN_IF_ERROR(add(OpSchema{
+      "Constant", 0, 0, 1,
+      [](Graph*, const Node&) { return Status::OK(); }}));
+  return Status::OK();
+}
 
 void PassManager::Add(std::unique_ptr<GraphPass> pass) {
   passes_.push_back(std::move(pass));

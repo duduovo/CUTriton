@@ -1,25 +1,14 @@
 # src/runtime
 
-本目录实现 ExecutablePlan 的资源准备、内存规划、异步执行和计时。
+`engine.cpp` 实现共享 EngineState 和 Context 私有执行状态：常量一次上传、Module Cache、
+profile/实际 shape、候选选择、Workspace view、内部/外部 stream、CUDA Graph LRU 和
+Event profiling。
 
-## engine.cpp
+调优在独立非阻塞 stream 上对完整候选序列预热并计时，验证 FP32 输出后把中位数结果
+按 tuning key 原子写入单独 JSON。`kUseCache` 先查精确 shape，profile 下再查 opt 点。
 
-- `EngineState` 共享 Plan 和一次性初始化的设备常量；Context 不依赖原 Engine 寿命。
-- 每个 `ExecutionContext` 惰性创建 Kernel、Workspace、中间 Tensor、CUDA primary
-  context、内部非阻塞 Stream、Graph 和可选 Event。
-- 输入输出绑定执行完整描述与 Buffer 边界校验；运行期间禁止重新绑定。
-- `RunAsync()` 支持内部或外部 `CUstream`，同一 Context 只允许一个 pending run；
-  `Synchronize()` 等待 Stream 并整理 profiling 结果。
-- 开启 CUDA Graph 后首次执行 capture/instantiate，之后 replay；重新绑定会销毁旧
-  Graph，捕获失败直接返回错误。
+Graph key 包含 profile、shape、候选、边界 Buffer 地址/offset 和 Workspace 地址。
+重新绑定不会清空全部缓存，只是不再命中地址不同的 Graph；LRU 默认容量为 4。
 
-## memory_planner.cpp
-
-规划器排除外部输入输出和常量，计算每个中间 Value 的最后使用位置，按 256 字节
-对齐使用 best-fit 空闲块复用。Flatten 输出复用源 Buffer，并把源值生命周期延长到
-alias 的最后一次使用。
-
-## profiler.cpp
-
-CPU Kernel 可使用 `ScopedCpuTimer`；CUDA Kernel 的真实 GPU 耗时由 `engine.cpp` 中的
-CUDA Event 产生。关闭 profiling 时不创建 Event，结果列表为空。
+`memory_planner.cpp` 排除输入输出和常量，按生命周期做 256 B 对齐 best-fit，并传播
+Flatten alias 生命周期。`profiler.cpp` 保存 CPU/真实 CUDA Event 的统一结果。
