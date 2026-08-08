@@ -1,0 +1,14 @@
+build/
+build-wsl-cuda/
+cmake-build-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+dist/
+*.egg-info/
+.claude
+.vscode
+tools/*.ps1
