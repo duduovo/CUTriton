@@ -11,4 +11,11 @@ dist/
 *.egg-info/
 .claude
 .vscode
-tools/*.ps1
+.cutriton-cache/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.corrupt-*
+*.ptx
+*.cubin
+*.jsonl
