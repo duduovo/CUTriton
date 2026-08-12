@@ -14,11 +14,36 @@ from triton.compiler import ASTSource
 
 from .spec import registered_specs
 
+#using：
+#source /root/.venvs/cutriton/bin/activate
+# cd /mnt/g/CUTriton/CUTriton
+# cmake --build build-aot-cuda-dev \
+#   --target cutriton_triton_kernels
 
 PACK_SCHEMA_VERSION = 2
-ABI_SCHEMA_VERSION = 1
-GENERATOR_VERSION = "0.2.0"
-DEFAULT_MODULES = ("cutriton.triton_kernels.resnet",)
+ABI_SCHEMA_VERSION = 2
+GENERATOR_VERSION = "0.3.0"
+DEFAULT_MODULES = (
+    "cutriton.triton_kernels.resnet",
+    "cutriton.triton_kernels.transformer",
+)
+
+
+def _literal(value: int) -> dict[str, Any]:
+    return {"kind": "literal", "value": value}
+
+
+def _normalize_grid(grid: Any) -> list[dict[str, Any]]:
+    if isinstance(grid, dict):
+        axes = [
+            {
+                "kind": "ceil_div",
+                "args": [grid["value"], _literal(grid["divisor"])],
+            }
+        ]
+    else:
+        axes = list(grid)
+    return axes + [_literal(1) for _ in range(3 - len(axes))]
 
 
 def _compile_spec(spec: Any, output: Path) -> list[dict[str, Any]]:
@@ -27,12 +52,11 @@ def _compile_spec(spec: Any, output: Path) -> list[dict[str, Any]]:
     kernel_dir.mkdir(parents=True, exist_ok=True)
     for variant in spec.variants:
         compiled = triton.compile(
-            ASTSource(spec.function, spec.signature),
+            ASTSource(spec.function, spec.signature, constexprs=variant.meta),
             target=GPUTarget("cuda", spec.min_compute_capability, 32),
             options={
                 "num_warps": variant.num_warps,
                 "num_stages": variant.num_stages,
-                **variant.meta,
             },
         )
         ptx = compiled.asm["ptx"]
@@ -60,7 +84,7 @@ def _compile_spec(spec: Any, output: Path) -> list[dict[str, Any]]:
                 "num_stages": variant.num_stages,
                 "shared_memory_bytes": int(compiled.metadata.shared),
                 "arguments": arguments,
-                "grid": spec.grid,
+                "grid": _normalize_grid(spec.grid),
                 "constraints": list(spec.constraints),
                 "tuning": dict(variant.meta),
             }
@@ -84,8 +108,8 @@ def build_pack(output: Path, modules: tuple[str, ...] = DEFAULT_MODULES) -> None
     pack = {
         "schema_version": PACK_SCHEMA_VERSION,
         "abi_schema_version": ABI_SCHEMA_VERSION,
-        "pack_name": "cutriton_builtin_fp32",
-        "pack_version": 1,
+        "pack_name": "cutriton_builtin",
+        "pack_version": 2,
         "generator_version": GENERATOR_VERSION,
         "triton_version": triton.__version__,
         "kernels": kernels,

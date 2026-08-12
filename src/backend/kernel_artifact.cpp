@@ -251,6 +251,92 @@ double OptionalDouble(const JsonValue& object, const std::string& key, double fa
   return value == nullptr ? fallback : value->number();
 }
 
+void RequireKeys(const JsonValue& value,
+                 std::initializer_list<const char*> allowed) {
+  std::unordered_set<std::string> keys;
+  for (const char* key : allowed) keys.insert(key);
+  for (const auto& entry : value.object()) {
+    if (keys.find(entry.first) == keys.end()) {
+      throw std::runtime_error("unknown grid expression field: " +
+                               entry.first);
+    }
+  }
+}
+
+GridExpression ParseGridExpression(const JsonValue& value, int depth = 0) {
+  if (depth > 8) throw std::runtime_error("grid expression is too deep");
+  GridExpression expression;
+  const std::string kind = value.at("kind").string();
+  if (kind == "literal") {
+    RequireKeys(value, {"kind", "value"});
+    expression.kind = GridExpressionKind::kLiteral;
+    expression.literal = Integer(value.at("value"));
+    if (expression.literal <= 0) {
+      throw std::runtime_error("grid literal must be positive");
+    }
+    return expression;
+  }
+  if (kind == "input_dim" || kind == "output_dim") {
+    RequireKeys(value, {"kind", "index", "axis"});
+    expression.kind = kind == "input_dim" ? GridExpressionKind::kInputDim
+                                           : GridExpressionKind::kOutputDim;
+    expression.tensor_index = Integer(value.at("index"));
+    expression.axis = Integer(value.at("axis"));
+    return expression;
+  }
+  if (kind == "input_numel" || kind == "output_numel") {
+    RequireKeys(value, {"kind", "index"});
+    expression.kind = kind == "input_numel"
+                          ? GridExpressionKind::kInputNumElements
+                          : GridExpressionKind::kOutputNumElements;
+    expression.tensor_index = Integer(value.at("index"));
+    return expression;
+  }
+  if (kind == "meta") {
+    RequireKeys(value, {"kind", "name"});
+    expression.kind = GridExpressionKind::kVariantMeta;
+    expression.meta_name = value.at("name").string();
+    if (expression.meta_name.empty()) {
+      throw std::runtime_error("grid meta name is empty");
+    }
+    return expression;
+  }
+  if (kind == "ceil_div" || kind == "mul") {
+    RequireKeys(value, {"kind", "args"});
+    const auto& operands = value.at("args").array();
+    if (operands.size() != 2) {
+      throw std::runtime_error(kind + " grid expression requires two operands");
+    }
+    expression.kind = kind == "ceil_div" ? GridExpressionKind::kCeilDiv
+                                         : GridExpressionKind::kMultiply;
+    for (const auto& operand : operands) {
+      expression.operands.push_back(ParseGridExpression(operand, depth + 1));
+    }
+    return expression;
+  }
+  throw std::runtime_error("unsupported grid expression kind: " + kind);
+}
+
+GridExpression LegacyGridExpression(const JsonValue& grid) {
+  if (grid.at("op").string() != "ceil_div" ||
+      grid.at("value").at("kind").string() != "output_numel") {
+    throw std::runtime_error("unsupported ABI v1 grid expression");
+  }
+  GridExpression numel;
+  numel.kind = GridExpressionKind::kOutputNumElements;
+  numel.tensor_index = OptionalInt(grid.at("value"), "index", 0);
+  GridExpression divisor;
+  divisor.kind = GridExpressionKind::kLiteral;
+  divisor.literal = Integer(grid.at("divisor"));
+  if (divisor.literal <= 0) {
+    throw std::runtime_error("grid divisor must be positive");
+  }
+  GridExpression result;
+  result.kind = GridExpressionKind::kCeilDiv;
+  result.operands = {std::move(numel), std::move(divisor)};
+  return result;
+}
+
 }  // namespace
 
 Status ArtifactRepository::Load(const std::vector<std::string>& paths) {
@@ -274,7 +360,8 @@ Status ArtifactRepository::Load(const std::vector<std::string>& paths) {
       if (Integer(pack.at("schema_version")) != 2) {
         return Status::InvalidArgument("Kernel Pack schema v2 is required; regenerate artifacts");
       }
-      if (Integer(pack.at("abi_schema_version")) != 1) {
+      const int abi_schema_version = Integer(pack.at("abi_schema_version"));
+      if (abi_schema_version != 1 && abi_schema_version != 2) {
         return Status::InvalidArgument("Unsupported Kernel Pack ABI schema");
       }
       const std::string pack_name = pack.at("pack_name").string();
@@ -288,7 +375,7 @@ Status ArtifactRepository::Load(const std::vector<std::string>& paths) {
         artifact.pack_version = pack_version;
         artifact.generator_version = generator;
         artifact.triton_version = triton_version;
-        artifact.abi_schema_version = 1;
+        artifact.abi_schema_version = abi_schema_version;
         artifact.kernel_id = entry.at("kernel_id").string();
         artifact.op_type = entry.at("op_type").string();
         artifact.kernel_version = Integer(entry.at("kernel_version"));
@@ -303,12 +390,26 @@ Status ArtifactRepository::Load(const std::vector<std::string>& paths) {
         artifact.num_warps = Integer(entry.at("num_warps"));
         artifact.num_stages = Integer(entry.at("num_stages"));
         artifact.shared_memory_bytes = Integer(entry.at("shared_memory_bytes"));
-        const auto& grid = entry.at("grid");
-        if (grid.at("op").string() != "ceil_div" ||
-            grid.at("value").at("kind").string() != "output_numel") {
-          throw std::runtime_error("unsupported grid expression");
+        if (abi_schema_version == 1) {
+          artifact.launch_grid[0] = LegacyGridExpression(entry.at("grid"));
+          artifact.grid_divisor = Integer(entry.at("grid").at("divisor"));
+        } else {
+          const auto& axes = entry.at("grid").array();
+          if (axes.empty() || axes.size() > artifact.launch_grid.size()) {
+            throw std::runtime_error("ABI v2 grid must have one to three axes");
+          }
+          for (std::size_t axis = 0; axis < axes.size(); ++axis) {
+            artifact.launch_grid[axis] = ParseGridExpression(axes[axis]);
+          }
+          const auto& tuning = entry.at("tuning").object();
+          for (const auto& meta : tuning) {
+            const int value = Integer(meta.second);
+            if (meta.first.empty() || value <= 0) {
+              throw std::runtime_error("variant launch metadata is invalid");
+            }
+            artifact.launch_meta.emplace(meta.first, value);
+          }
         }
-        artifact.grid_divisor = Integer(grid.at("divisor"));
         const std::filesystem::path relative(entry.at("binary").string());
         if (relative.is_absolute() || relative.string().find("..") != std::string::npos) {
           throw std::runtime_error("unsafe Kernel Pack binary path");
@@ -356,7 +457,7 @@ Status ArtifactRepository::Load(const std::vector<std::string>& paths) {
         }
         if (reserved_arguments != 2) {
           throw std::runtime_error(
-              "ABI schema 1 requires two runtime reserved arguments");
+              "Kernel ABI requires two runtime reserved arguments");
         }
         for (const auto& constraint_value : entry.at("constraints").array()) {
           KernelConstraint constraint;
@@ -385,7 +486,7 @@ Status ArtifactRepository::Load(const std::vector<std::string>& paths) {
         }
         if (artifact.kernel_id.empty() || artifact.variant_id.empty() ||
             artifact.symbol.empty() || artifact.arguments.empty() ||
-            artifact.binary_format != "ptx" || artifact.grid_divisor <= 0) {
+            artifact.binary_format != "ptx") {
           throw std::runtime_error("incomplete kernel artifact entry");
         }
         repository_material += artifact.sha256;

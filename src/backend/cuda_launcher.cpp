@@ -1,5 +1,6 @@
 #include "cutriton/backend/backend.h"
 
+#include <array>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -287,6 +288,94 @@ class ArgumentBinder {
   }
 };
 
+Status EvaluateGridExpression(const GridExpression& expression,
+                              const KernelInvocation& invocation,
+                              KernelContext* context, int64_t* output) {
+  if (context == nullptr || context->tensors == nullptr || output == nullptr) {
+    return Status::InvalidArgument("invalid launch-grid evaluation context");
+  }
+  auto tensor_value = [&](const std::vector<std::string>& names,
+                          int index, const Tensor** tensor) -> Status {
+    if (index < 0 || index >= static_cast<int>(names.size())) {
+      return Status::InvalidArgument("launch-grid Tensor index is invalid");
+    }
+    const auto found = context->tensors->find(names[static_cast<std::size_t>(index)]);
+    if (found == context->tensors->end()) {
+      return Status::NotFound("launch-grid Tensor is not bound");
+    }
+    *tensor = &found->second;
+    return Status::OK();
+  };
+  switch (expression.kind) {
+    case GridExpressionKind::kLiteral:
+      *output = expression.literal;
+      break;
+    case GridExpressionKind::kVariantMeta: {
+      const auto found = invocation.artifact.launch_meta.find(expression.meta_name);
+      if (found == invocation.artifact.launch_meta.end()) {
+        return Status::InvalidArgument("launch-grid references missing variant meta: " +
+                                       expression.meta_name);
+      }
+      *output = found->second;
+      break;
+    }
+    case GridExpressionKind::kInputDim:
+    case GridExpressionKind::kOutputDim: {
+      const auto& names = expression.kind == GridExpressionKind::kInputDim
+                              ? invocation.inputs
+                              : invocation.outputs;
+      const Tensor* tensor = nullptr;
+      CUTRITON_RETURN_IF_ERROR(
+          tensor_value(names, expression.tensor_index, &tensor));
+      const auto& shape = tensor->desc().shape;
+      if (expression.axis < 0 ||
+          expression.axis >= static_cast<int>(shape.size())) {
+        return Status::ShapeError("launch-grid Tensor axis is invalid");
+      }
+      *output = shape[static_cast<std::size_t>(expression.axis)];
+      break;
+    }
+    case GridExpressionKind::kInputNumElements:
+    case GridExpressionKind::kOutputNumElements: {
+      const auto& names =
+          expression.kind == GridExpressionKind::kInputNumElements
+              ? invocation.inputs
+              : invocation.outputs;
+      const Tensor* tensor = nullptr;
+      CUTRITON_RETURN_IF_ERROR(
+          tensor_value(names, expression.tensor_index, &tensor));
+      *output = tensor->desc().NumElements();
+      break;
+    }
+    case GridExpressionKind::kCeilDiv:
+    case GridExpressionKind::kMultiply: {
+      if (expression.operands.size() != 2) {
+        return Status::InvalidArgument("launch-grid binary expression is malformed");
+      }
+      int64_t left = 0;
+      int64_t right = 0;
+      CUTRITON_RETURN_IF_ERROR(EvaluateGridExpression(
+          expression.operands[0], invocation, context, &left));
+      CUTRITON_RETURN_IF_ERROR(EvaluateGridExpression(
+          expression.operands[1], invocation, context, &right));
+      if (left <= 0 || right <= 0) {
+        return Status::ShapeError("launch-grid operands must be positive");
+      }
+      if (expression.kind == GridExpressionKind::kCeilDiv) {
+        *output = 1 + (left - 1) / right;
+      } else {
+        if (left > std::numeric_limits<int64_t>::max() / right) {
+          return Status::ShapeError("launch-grid multiplication overflow");
+        }
+        *output = left * right;
+      }
+      break;
+    }
+  }
+  return *output > 0 ? Status::OK()
+                     : Status::ShapeError("launch-grid dimension is not positive");
+}
+
 class InvocationKernel final : public OpKernel {
  public:
   static Status Create(KernelInvocation invocation, int device_id,
@@ -310,16 +399,21 @@ class InvocationKernel final : public OpKernel {
     std::vector<void*> parameters;
     CUTRITON_RETURN_IF_ERROR(
         ArgumentBinder{}.Bind(invocation_, context, &storage, &parameters));
-    const Tensor& output = context->tensors->at(invocation_.outputs.front());
-    const auto count = output.desc().NumElements();
-    if (count <= 0) return Status::ShapeError("Kernel output has no elements");
-    const auto grid = static_cast<unsigned int>(
-        (count + invocation_.artifact.grid_divisor - 1) /
-        invocation_.artifact.grid_divisor);
+    std::array<unsigned int, 3> grid{};
+    for (std::size_t axis = 0; axis < grid.size(); ++axis) {
+      int64_t value = 0;
+      CUTRITON_RETURN_IF_ERROR(EvaluateGridExpression(
+          invocation_.artifact.launch_grid[axis], invocation_, context,
+          &value));
+      if (value > std::numeric_limits<unsigned int>::max()) {
+        return Status::ShapeError("launch-grid dimension exceeds CUDA limits");
+      }
+      grid[axis] = static_cast<unsigned int>(value);
+    }
     CUcontext cuda_context{};
     CUTRITON_RETURN_IF_ERROR(CudaStatus(cuCtxGetCurrent(&cuda_context), "cuCtxGetCurrent"));
     return CudaStatus(
-        cuLaunchKernel(function_, grid, 1, 1,
+        cuLaunchKernel(function_, grid[0], grid[1], grid[2],
                        static_cast<unsigned int>(invocation_.artifact.num_warps * 32),
                        1, 1,
                        static_cast<unsigned int>(invocation_.artifact.shared_memory_bytes),

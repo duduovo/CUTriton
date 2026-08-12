@@ -69,13 +69,41 @@ class KernelSdkTest(unittest.TestCase):
     def test_rejects_arbitrary_grid_and_constraint_expressions(self):
         spec = _spec()
         object.__setattr__(spec, "grid", {"op": "python", "callable": "evil"})
-        with self.assertRaisesRegex(ValueError, "ceil_div"):
+        with self.assertRaisesRegex(ValueError, "grid"):
             spec.validate()
         spec = _spec()
         object.__setattr__(
             spec, "constraints", ({"kind": "python", "expression": "x"},)
         )
         with self.assertRaisesRegex(ValueError, "unsafe constraint"):
+            spec.validate()
+
+    def test_accepts_safe_multidimensional_grid(self):
+        spec = _spec(variants=(KernelVariant("tiled", meta={"BLOCK": 64}, default=True),))
+        object.__setattr__(
+            spec,
+            "grid",
+            (
+                {
+                    "kind": "ceil_div",
+                    "args": [
+                        {"kind": "output_dim", "index": 0, "axis": 0},
+                        {"kind": "meta", "name": "BLOCK"},
+                    ],
+                },
+                {"kind": "literal", "value": 2},
+            ),
+        )
+        spec.validate()
+
+    def test_rejects_unknown_grid_meta(self):
+        spec = _spec()
+        object.__setattr__(
+            spec,
+            "grid",
+            ({"kind": "meta", "name": "UNDECLARED"},),
+        )
+        with self.assertRaisesRegex(ValueError, "unknown variant meta"):
             spec.validate()
 
 
