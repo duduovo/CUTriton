@@ -4,8 +4,9 @@ CUTriton 是一个 C++17 静态图推理引擎实验项目：C++ 负责 IR、图
 内存规划和 CUDA Runtime，Python/Triton 只负责定义并离线编译 Kernel。生产运行时不
 启动 Python，只读取版本化 Kernel Pack，通过 CUDA Driver API 执行 PTX。
 
-当前里程碑已经在 RTX 4060 上真实执行完整 FP32 ResNet-50，包括动态 shape profile、
-融合与非融合候选、AOT 变体调优、CUDA Graph LRU、Module Cache 和 GPU profiling。
+当前里程碑已经在 RTX 4060 上真实执行完整 FP32 ResNet-50 和 FP16 Transformer FFN，
+包括动态 shape profile、融合与非融合候选、AOT 变体调优、CUDA Graph LRU、Module
+Cache 和 GPU profiling。
 生产路径没有 NoOp；没有真实实现时会明确返回 `Unsupported`。
 
 > 项目状态：`0.1`，适合学习、架构验证和 Kernel 研究，尚不能替代 TensorRT、
@@ -44,7 +45,7 @@ C++ Model / IR（不依赖 Triton）
 | --- | --- |
 | Core | `Status`、CPU/CUDA `Buffer`、Host↔Device 拷贝、Tensor view、严格边界校验 |
 | IR | Model/Graph/Node/Value/Attribute、Host 常量、线程安全 `OpSchemaRegistry` |
-| Pass | 拓扑排序、shape 推导、DCE、Conv-BN(-ReLU)/Add-ReLU 融合、Flatten/Gemm 规范化 |
+| Pass | 拓扑排序、shape 推导、DCE、CNN 融合、Gemm-GELU 与 Skip-LayerNorm 融合 |
 | Kernel SDK | 模块化 `KernelSpec` 注册、安全参数来源和约束 AST、薄构建 CLI |
 | Kernel Pack | schema v2、ABI schema、版本/符号/grid/约束、PTX SHA-256、多个 pack 路径 |
 | Compiler | `Backend::Lower`、`KernelCatalog`、融合/非融合 `ExecutionCandidate`、profile 最大内存规划 |
@@ -53,7 +54,7 @@ C++ Model / IR（不依赖 Triton）
 | Dynamic shape | 有边界 min/opt/max profile、运行时 shape 推导、最大 Workspace、输出描述查询 |
 | CUDA Graph | 按 profile/shape/candidate/地址/workspace 建键，Context 内默认 4 项 LRU |
 | Profiling | 每个计算步骤的真实 CUDA Event 耗时；view 事件为 0 |
-| 模型验证 | ResNet Stem 和完整 ResNet-50 均与 PyTorch FP32 对齐 |
+| 模型验证 | ResNet-50 FP32 与 Transformer FFN FP16 均有 GPU 正确性/性能对照 |
 
 内置 FP32 AOT 实现包括：
 
@@ -62,16 +63,20 @@ C++ Model / IR（不依赖 Triton）
 - `MaxPool`、`GlobalAveragePool`、`Gemm`
 - `Flatten` 零拷贝 view
 
+内置 FP16 Transformer 实现包括 Tensor Core `Gemm`、`Gelu`、`Add`、
+`LayerNormalization`、`GemmGelu` 和 `SkipLayerNormalization`。矩阵乘使用 `tl.dot`、
+二维 blocking、grouped program ordering 与 4 组 AOT tile 配置。
+
 每个计算 op 当前生成 `warps2` 和 `warps4` 两个 AOT 变体。融合节点还会得到可执行的
 非融合候选，调优以完整候选序列为单位计时。
 
 ## 当前限制
 
 - 单 NVIDIA GPU，Compute Capability 8.0+。
-- FP32；图像 Tensor 为 NCHW，卷积权重为 OIHW。
+- FP32 CNN 与受限 FP16 Transformer FFN；图像 Tensor 为 NCHW，卷积权重为 OIHW。
 - 动态 shape 必须落在明确的 min/opt/max profile 内。
 - CUDA 输入输出必须已在同一 `device_id`，Runtime 不自动插入 H2D/D2H 节点。
-- 不支持跨设备 CPU fallback、FP16/TF32、动态共享库插件 ABI。
+- 不支持跨设备 CPU fallback、TF32/INT8/FP8、完整 Attention/KV Cache 或多 GPU。
 - `cpu_reference` 生产后端尚未实现真实 C++ 算子，会返回 `Unsupported`。
 - Python 轻量 API 尚未通过 pybind11 连接原生 C++ Engine。
 
@@ -97,9 +102,9 @@ triton_kernels/
 
 `pack.json` 保存 pack/生成器/Triton/ABI 版本，Kernel 与 variant ID，有序参数 ABI，
 安全参数来源，dtype/layout/rank/Attribute 约束，grid、warp、shared memory、目标 SM、
-符号、PTX 路径和 SHA-256。C++ 只接受 schema v2 和支持的 ABI schema；manifest v1
-会提示重新生成。它不要求 Triton 版本字符串必须恰好等于某个值，Triton 版本会进入
-调优和产物身份。
+符号、PTX 路径和 SHA-256。v2 grid 是受限 AST，支持 literal、输入/输出维度、numel、
+`ceil_div`、`mul` 和 variant launch metadata。C++ Loader 兼容历史 v1，同时严格拒绝
+未知表达式、非法字段和越界索引。Triton 版本会进入调优和产物身份。
 
 ## 快速开始
 
@@ -217,7 +222,7 @@ const auto* output_desc = context->GetResolvedTensorDesc("output");
 | `kForceRetune` | 忽略旧值，重新测量并原子覆盖 |
 
 默认预热 5 次、测量 20 次并取中位数。首次选择会把各候选输出复制到 Host，与确定性
-基线按 `atol=1e-4, rtol=1e-4` 比较。缓存键包含 op/融合方案、完整属性、shape、
+基线比较；FP32 默认 `1e-4`，FP16 默认 `1e-2`。缓存键包含 op/融合方案、完整属性、shape、
 dtype/layout、GPU UUID/SM、Driver、pack、PTX、生成器、Triton 和 ABI 身份；每个 key
 一个 JSON 文件，通过临时文件和原子 rename 写入。
 
@@ -246,10 +251,40 @@ python benchmarks/resnet50_compare.py \
   --warmup 5 --iterations 20
 ```
 
+## Transformer FFN 正确性与性能
+
+基准使用 BERT-tiny 的 `H=128, I=512`，并覆盖非整块 token 数。RTX 4060、
+`tokens=1024`、FP16、50 次预热/200 次测量的当前基线：
+
+| 实现 | CUDA Event 延迟 | 说明 |
+| --- | ---: | --- |
+| AOT `GemmGelu` 融合候选 | 0.034816 / 0.049728 ms | p50 / p95 |
+| AOT 未融合候选 | 0.043008 / 0.053920 ms | 融合 p50 快约 19.6% |
+| ONNX Runtime CUDA 子图 | 0.115712 / 0.166912 ms | AOT 融合快约 3.32x |
+| PyTorch eager | 0.031104 / 0.031744 ms | 仍快于当前 AOT |
+
+最大绝对误差为 `9.77e-4`，Engine 建立中位数约 `405.5 ms`。这里达到的是 FFN 子图
+相对 ORT 超过 20% 的门槛，不代表 BERT 整图加速；融合相对未融合约快 19.6%。
+
+```bash
+python benchmarks/transformer_ffn_compare.py \
+  --executable build-aot-cuda-dev/cutriton_transformer_ffn_benchmark \
+  --tokens 1024 --warmup 50 --iterations 200 \
+  --rounds 5 --json build-aot-cuda-dev/transformer_ffn_report.json
+```
+
+安装 Nsight Systems/Compute 后可生成 `.nsys-rep`、`.ncu-rep` 和 CSV 摘要：
+
+```bash
+bash tools/profile_transformer_ffn.sh \
+  build-aot-cuda-dev/cutriton_transformer_ffn_benchmark \
+  build-aot-cuda-dev/nsight-transformer 1024
+```
+
 ## 测试覆盖
 
 - KernelSpec 注册、ABI 顺序、安全 source/grid/constraint AST。
-- pack 缺字段/旧 schema、PTX SHA 损坏、SM 不兼容和缺失产物。
+- v1/v2 pack 兼容、非法 grid AST/metadata、PTX SHA 损坏、SM 不兼容和缺失产物。
 - OpSchema、FusionRegistry、注册表并发和 Engine/Context 生命周期。
 - 256 B 对齐、best-fit、Flatten alias、候选临时空间和真实 Workspace view。
 - Module Cache：同一 PTX 在多节点、多 Context 中只加载一次。
@@ -257,6 +292,7 @@ python benchmarks/resnet50_compare.py \
 - profile min/opt/max、越界 shape、运行时输出 shape 和最大 Workspace。
 - 不同 shape/绑定地址的 CUDA Graph LRU、内部/外部 stream、异步限制。
 - ResNet Stem、动态 H/W 和完整 ResNet-50 与 PyTorch 对齐。
+- FP16 Transformer 奇数边界 shape、融合/未融合候选与 CPU 参考对齐。
 - Linux CPU-only 与 WSL2 CUDA 构建。
 
 ## 扩展方式

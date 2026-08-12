@@ -1,5 +1,7 @@
 build/
 build-wsl-cuda/
+build-aot-dev/
+build-aot-cuda-dev/
 cmake-build-*/
 __pycache__/
 *.py[cod]

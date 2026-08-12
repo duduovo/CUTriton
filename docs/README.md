@@ -6,6 +6,8 @@
   CUDA Graph LRU 的整体架构。
 - [`development.md`](development.md)：扩展 Kernel/op/融合/动态 shape 时的修改边界、
   构建测试命令和代码地图。
+- [`implementation_walkthrough.md`](implementation_walkthrough.md)：本轮 AOT Transformer
+  与 Python JIT/ORT 实现清单，以及按调用链逐文件阅读的中文导读。
 - 根目录 [`README.md`](../README.md)：面向使用者的项目门户、现状、性能与快速开始。
 
 ## 与其他目录的关系
