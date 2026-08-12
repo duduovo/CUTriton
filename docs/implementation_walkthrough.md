@@ -516,15 +516,15 @@ main
 
 | 实现 | p50 | p95 |
 | --- | ---: | ---: |
-| CUTriton AOT fused | 0.034816 ms | 0.049728 ms |
-| CUTriton AOT unfused | 0.043008 ms | 0.053920 ms |
-| ORT CUDA subgraph | 0.115712 ms | 0.166912 ms |
-| PyTorch eager | 0.031104 ms | 0.031744 ms |
+| CUTriton AOT fused | 0.033728 ms | 0.038912 ms |
+| CUTriton AOT unfused | 0.038848 ms | 0.044704 ms |
+| ORT CUDA subgraph | 0.113728 ms | 0.143360 ms |
+| PyTorch eager | 0.030816 ms | 0.031712 ms |
 
 结论必须准确表述为：
 
-- AOT fused 相对 ORT 子图约 `3.32x`；
-- 融合相对未融合 p50 约快 `19.6%`；
+- AOT fused 相对 ORT 子图约 `3.372x`；
+- 融合相对未融合约为 `1.154x`；
 - PyTorch eager 仍略快于当前 AOT；
 - 这不是 BERT 整图加速。
 
@@ -805,7 +805,7 @@ main
 
 > 当前 BERT hybrid plan 没有整图加速；性能门禁正确禁用了候选，回退路径满足不慢于 ORT 2% 的要求。
 
-不要把它写成“BERT 加速 3.32x”。`3.32x` 只属于 AOT FFN 子图。
+不要把它写成“BERT 加速 3.372x”。`3.372x` 只属于 AOT FFN 子图。
 
 ---
 
@@ -973,7 +973,7 @@ bash tools/profile_transformer_ffn.sh \
 3. **Kernel ABI**：Triton 只负责离线生成 PTX；版本化 manifest 描述参数、约束、安全 grid AST 和 variant metadata。
 4. **Runtime**：C++ Loader 验证 pack，Backend Lower 成 invocation，通用 CUDA Launcher 解释 AST 并调用 Driver API。
 5. **优化**：实现 FP16 Tensor Core GemmGelu 与 SkipLayerNorm，Runtime 依据真实 shape/GPU 调优，而非强制融合。
-6. **真实结果**：BERT-tiny 尺寸 FFN 相对 ORT 子图约 3.32x，但仍略慢于 PyTorch eager。
+6. **真实结果**：BERT-tiny 尺寸 FFN 相对 ORT 子图约 3.372x，但仍略慢于 PyTorch eager。
 7. **整图诚实回退**：BERT hybrid 没有整图收益，因此自动禁用，回退路径保持在 ORT 的 2% 内。
 8. **系统问题**：KServe 压测发现冷动态 batch 初始化分段 Session 导致秒级 p95，改为 whole-model ORT fast path 和热度触发后台资格验证后解决。
 

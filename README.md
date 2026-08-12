@@ -258,27 +258,28 @@ python benchmarks/resnet50_compare.py \
 
 | 实现 | CUDA Event 延迟 | 说明 |
 | --- | ---: | --- |
-| AOT `GemmGelu` 融合候选 | 0.034816 / 0.049728 ms | p50 / p95 |
-| AOT 未融合候选 | 0.043008 / 0.053920 ms | 融合 p50 快约 19.6% |
-| ONNX Runtime CUDA 子图 | 0.115712 / 0.166912 ms | AOT 融合快约 3.32x |
-| PyTorch eager | 0.031104 / 0.031744 ms | 仍快于当前 AOT |
+| AOT `GemmGelu` 融合候选 | 0.033728 / 0.038912 ms | p50 / p95 |
+| AOT 未融合候选 | 0.038848 / 0.044704 ms | 融合 p50 延迟降低约 13.2% |
+| ONNX Runtime CUDA 子图 | 0.113728 / 0.143360 ms | AOT 融合快约 3.372x |
+| PyTorch eager | 0.030816 / 0.031712 ms | 仍快于当前 AOT |
 
-最大绝对误差为 `9.77e-4`，Engine 建立中位数约 `405.5 ms`。这里达到的是 FFN 子图
-相对 ORT 超过 20% 的门槛，不代表 BERT 整图加速；融合相对未融合约快 19.6%。
+最大绝对误差为 `9.77e-4`，Engine 建立中位数约 `298.4 ms`。这里达到的是 FFN 子图
+相对 ORT 超过 20% 的门槛，不代表 BERT 整图加速；融合相对未融合约为 `1.154x`。
+本次运行的原始数据见 [`reports/rtx4060/transformer_ffn_8978d9f.json`](reports/rtx4060/transformer_ffn_8978d9f.json)。
 
 ```bash
 python benchmarks/transformer_ffn_compare.py \
-  --executable build-aot-cuda-dev/cutriton_transformer_ffn_benchmark \
+  --executable /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/cutriton_transformer_ffn_benchmark \
   --tokens 1024 --warmup 50 --iterations 200 \
-  --rounds 5 --json build-aot-cuda-dev/transformer_ffn_report.json
+  --rounds 5 --json /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/transformer_ffn_report.json
 ```
 
 安装 Nsight Systems/Compute 后可生成 `.nsys-rep`、`.ncu-rep` 和 CSV 摘要：
 
 ```bash
 bash tools/profile_transformer_ffn.sh \
-  build-aot-cuda-dev/cutriton_transformer_ffn_benchmark \
-  build-aot-cuda-dev/nsight-transformer 1024
+  /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/cutriton_transformer_ffn_benchmark \
+  /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/nsight-transformer 1024
 ```
 
 ## 测试覆盖

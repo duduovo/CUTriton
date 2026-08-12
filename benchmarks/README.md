@@ -10,25 +10,25 @@
   PyTorch eager，检查 FP16 误差并生成 JSON 报告。
 
 ```bash
-cmake --build build-aot-cuda-dev --parallel \
+cmake --build /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda --parallel \
   --target cutriton_transformer_ffn_benchmark
 python benchmarks/transformer_ffn_compare.py \
-  --executable build-aot-cuda-dev/cutriton_transformer_ffn_benchmark \
+  --executable /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/cutriton_transformer_ffn_benchmark \
   --tokens 1024 --warmup 50 --iterations 200 \
-  --rounds 5 --json build-aot-cuda-dev/transformer_ffn_report.json
+  --rounds 5 --json /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/transformer_ffn_report.json
 ```
 
-当前 RTX 4060 五轮基线中，融合 AOT p50/p95 为 `0.034816/0.049728 ms`，未融合为
-`0.043008/0.053920 ms`，ORT CUDA 子图为 `0.115712/0.166912 ms`，PyTorch eager
-为 `0.031104/0.031744 ms`。因此 AOT 相对 ORT 子图达到约 `3.32x`，但仍慢于
-PyTorch；融合相对未融合的 p50 收益约 `19.6%`。
+当前 RTX 4060 五轮基线中，融合 AOT p50/p95 为 `0.033728/0.038912 ms`，未融合为
+`0.038848/0.044704 ms`，ORT CUDA 子图为 `0.113728/0.143360 ms`，PyTorch eager
+为 `0.030816/0.031712 ms`。因此 AOT 相对 ORT 子图达到约 `3.372x`，但仍慢于
+PyTorch；融合相对未融合约为 `1.154x`。
 
 Nsight 一键采集：
 
 ```bash
 bash tools/profile_transformer_ffn.sh \
-  build-aot-cuda-dev/cutriton_transformer_ffn_benchmark \
-  build-aot-cuda-dev/nsight-transformer 1024
+  /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/cutriton_transformer_ffn_benchmark \
+  /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/nsight-transformer 1024
 ```
 
 ## 完整 ResNet-50
