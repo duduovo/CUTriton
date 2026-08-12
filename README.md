@@ -1,422 +1,349 @@
 # CUTriton
 
-一个以 C++17 为核心、使用 Triton 生成 CUDA Kernel 的静态图推理引擎实验项目。
+CUTriton 是一个 C++17 静态图推理引擎实验项目：C++ 负责 IR、图优化、Lowering、
+内存规划和 CUDA Runtime，Python/Triton 只负责定义并离线编译 Kernel。生产运行时不
+启动 Python，只读取版本化 Kernel Pack，通过 CUDA Driver API 执行 PTX。
 
-CUTriton 把模型语义、图优化、后端能力检查、内存规划与运行时执行分成清晰的模块，
-当前首个可运行里程碑是：在单张 NVIDIA GPU 上真实执行 FP32 ResNet Stem 风格计算链，
-而不是用 NoOp Kernel 模拟成功。
+当前里程碑已经在 RTX 4060 上真实执行完整 FP32 ResNet-50 和 FP16 Transformer FFN，
+包括动态 shape profile、融合与非融合候选、AOT 变体调优、CUDA Graph LRU、Module
+Cache 和 GPU profiling。
+生产路径没有 NoOp；没有真实实现时会明确返回 `Unsupported`。
 
-> 项目状态：`0.1 / V1`。核心链路已经跑通并有真实 GPU 集成测试，但它仍是学习、研究
-> 和架构验证阶段的推理引擎，不是可直接替代 TensorRT 或 ONNX Runtime 的生产部署套件。
+> 项目状态：`0.1`，适合学习、架构验证和 Kernel 研究，尚不能替代 TensorRT、
+> ONNX Runtime 或 cuDNN。当前直接卷积 Kernel 以正确性为主，性能仍有明显差距。
 
-## 项目做了什么
-
-CUTriton 当前可以把一个带常量权重的 C++ `Model` 编译成 `ExecutablePlan`，然后由
-`Engine` 在 CUDA 设备上执行：
-
-```text
-Model + Host constants
-        |
-        v
-Compiler
-  ├─ 复制 Graph，不修改原始 Model
-  ├─ 拓扑排序与形状推导
-  ├─ DCE 与算子规范化
-  ├─ Conv + BatchNorm + ReLU 融合
-  ├─ Backend::CheckSupport
-  └─ Workspace / alias 内存规划
-        |
-        v
-ExecutablePlan
-  ├─ 优化后的 Graph
-  ├─ 拓扑有序的 PlanOp
-  ├─ 常量 Tensor
-  ├─ 目标设备与 Kernel 产物目录
-  └─ MemoryPlan / CUDA Graph / profiling 配置
-        |
-        v
-EngineState（Plan 与设备常量共享）
-        |
-        v
-ExecutionContext（每个并发任务独占）
-  ├─ 输入输出绑定与完整校验
-  ├─ CUDA Stream
-  ├─ Workspace 与中间 Tensor view
-  ├─ Triton PTX Kernel
-  ├─ CUDA Graph capture / replay
-  └─ CUDA Event profiling
-```
-
-当前真实 GPU 测试执行如下链路：
+## 架构
 
 ```text
-Input [1, 3, 224, 224]
-  -> FusedConvBatchNormRelu
-  -> GlobalAveragePool
-  -> Flatten（零拷贝 view）
-  -> Gemm
-  -> Output [1, 1000]
+C++ Model / IR（不依赖 Triton）
+  -> OpSchemaRegistry：参数合法性与具体 shape 推导
+  -> Graph Pass：规范化并识别融合子图
+  -> FusionRegistry：生成语义等价的融合/非融合候选
+  -> ArtifactRepository：解析并验证 Kernel Pack v2
+  -> KernelCatalog + Backend::Lower：生成 ExecutionCandidate
+  -> ExecutablePlan：保存 KernelInvocation / ViewInvocation
+  -> EngineState：共享常量显存与 PTX Module/Function Cache
+  -> ExecutionContext：解析 profile/shape、选择调优结果
+  -> 声明式参数绑定 + 通用 cuLaunchKernel
+  -> CUDA Graph LRU + CUDA Event profiling
 ```
 
-输出会与 PyTorch FP32 参考实现按 `atol=1e-4`、`rtol=1e-4` 比较。
+这里最重要的边界是：
 
-## 设计重点
+- IR 不认识 Triton，也不保存 Python callable。
+- Kernel 的参数 ABI、约束、grid 和产物身份都来自 `pack.json`。
+- Backend 只在编译期 Lower；Context 不再根据 `op_type` 决定怎样启动 Kernel。
+- 所有计算 Kernel 走同一个通用 launcher；`Flatten` 是零拷贝 `ViewInvocation`。
+- 新增已有 IR op 的 Kernel 变体，不需要修改 C++ launcher 或 Runtime。
+- 新增 IR op 需要注册 C++ `OpSchema`，但不需要增加专用 launcher。
 
-- **编译期与运行期分离**：Pass、后端选择和内存规划在编译期完成，运行时只执行
-  稳定的 Plan。
-- **IR 是中心契约**：Importer、Pass、Backend、MemoryPlanner 和 Engine 围绕同一套
-  `Graph`、`Node`、`ValueDesc` 与 `TensorDesc` 工作。
-- **没有虚假成功**：生产后端不存在 NoOp Kernel；缺少算子实现、Kernel 产物或设备
-  能力时返回带原因的 `Status`。
-- **真实常量生命周期**：Model 保存 Host 常量，Plan 携带常量，EngineState 一次性上传
-  并在多个 Context 之间共享设备常量。
-- **显式内存规划**：中间 Tensor 使用单块 Workspace、256 字节对齐和 best-fit 复用；
-  Flatten 使用 alias，不产生额外拷贝。
-- **Context 级资源隔离**：每个 Context 独占 Stream、Workspace、Kernel、CUDA Graph
-  和 Event；多个 Context 可以并行，单个 Context 非线程安全。
-- **离线 Triton 产物**：构建阶段生成 PTX 和版本化 manifest，C++ 运行时不依赖 Python。
+详细说明见 [架构文档](docs/architecture.md) 和 [开发文档](docs/development.md)。
 
-## 当前能力
+## 已完成功能
 
-| 模块 | 状态 | 当前范围 |
-| --- | --- | --- |
-| C++ IR | 完成首版 | Model、Graph、Node、Value、Attribute、Host 常量 |
-| Graph Pass | 完成首版 | 拓扑排序、形状推导、DCE、融合、规范化、静态校验 |
-| Backend 系统 | 完成首版 | 详细能力检查、Kernel 工厂、线程安全注册表 |
-| CUDA Buffer | 可用 | Driver API 显存分配、同步 H2D/D2H、外部 Buffer 包装 |
-| MemoryPlanner | 可用 | 静态 shape、256 B 对齐、best-fit、Flatten alias |
-| CUDA Runtime | 可用 | 内部/外部 Stream、异步提交、同步、Graph、Event |
-| Triton Kernel | 可用 | FP32 FusedConvBNReLU、GAP、Gemm；Flatten 为 view |
-| GPU 数值测试 | 通过 | ResNet Stem 风格链路与 PyTorch FP32 对齐 |
-| C++ CPU backend | 未完成 | `cpu_reference` 对真实计算明确返回 `Unsupported` |
-| Python API | 参考门面 | JSON/ONNX 结构读取和少量 Python 参考算子 |
-| 原生 ONNX importer | 未完成 | 尚未把 ONNX initializer/attribute 完整 lowering 到 C++ IR |
-| Python/C++ 绑定 | 未完成 | 尚未使用 pybind11 暴露原生 C++ Engine |
-
-## 当前约束
-
-首个里程碑刻意限制范围，以保证执行语义和错误边界清晰：
-
-- 静态 shape。
-- FP32。
-- 图像算子采用 NCHW，卷积权重采用 OIHW。
-- 单张 NVIDIA GPU，默认 `device_id=0`。
-- Kernel 产物最低 Compute Capability 为 8.0；当前已在 RTX 4060（SM 8.9）验证。
-- CUDA 图中不允许 CPU 节点；跨设备 fallback 尚未实现。
-- GPU 输入输出必须已经位于同一目标 CUDA 设备，不自动插入 H2D/D2H 节点。
-- 没有动态 shape、FP16/TF32、自动调优、显存池和 `cudaMallocAsync`。
-- 当前测试链路是 ResNet Stem 风格子图，不是完整 ResNet-50。
-
-## 已验证环境
-
-以下组合已在本仓库实际构建并通过测试：
-
-| 组件 | 版本 |
+| 模块 | 当前能力 |
 | --- | --- |
-| Windows | Windows 10 22H2 + WSL2 |
-| Linux | Ubuntu 24.04 LTS |
-| GPU | NVIDIA GeForce RTX 4060，Compute Capability 8.9 |
-| Windows NVIDIA Driver | 610.74 |
-| CUDA Toolkit | 13.0.88 |
-| Python | 3.12.3 |
-| PyTorch | 2.11.0+cu130 |
-| Triton | 3.6.0 |
-| CMake / Compiler | CMake 3.28，GCC 13.3，Ninja 1.11 |
+| Core | `Status`、CPU/CUDA `Buffer`、Host↔Device 拷贝、Tensor view、严格边界校验 |
+| IR | Model/Graph/Node/Value/Attribute、Host 常量、线程安全 `OpSchemaRegistry` |
+| Pass | 拓扑排序、shape 推导、DCE、CNN 融合、Gemm-GELU 与 Skip-LayerNorm 融合 |
+| Kernel SDK | 模块化 `KernelSpec` 注册、安全参数来源和约束 AST、薄构建 CLI |
+| Kernel Pack | schema v2、ABI schema、版本/符号/grid/约束、PTX SHA-256、多个 pack 路径 |
+| Compiler | `Backend::Lower`、`KernelCatalog`、融合/非融合 `ExecutionCandidate`、profile 最大内存规划 |
+| 调优 | Disabled/UseCache/TuneOnMiss/ForceRetune、独立 stream/event、中位数、原子 JSON 缓存、数值校验 |
+| Runtime | 常量一次上传、共享 Module Cache、通用 launcher、内部/外部 stream、异步执行 |
+| Dynamic shape | 有边界 min/opt/max profile、运行时 shape 推导、最大 Workspace、输出描述查询 |
+| CUDA Graph | 按 profile/shape/candidate/地址/workspace 建键，Context 内默认 4 项 LRU |
+| Profiling | 每个计算步骤的真实 CUDA Event 耗时；view 事件为 0 |
+| 模型验证 | ResNet-50 FP32 与 Transformer FFN FP16 均有 GPU 正确性/性能对照 |
 
-CUDA/Triton 主线以 WSL2/Linux 为准；原生 Windows 保留 CPU-only 构建与架构测试。
+内置 FP32 AOT 实现包括：
+
+- `Conv`、`BatchNormalization`、`Relu`、`Add`
+- `FusedConvBatchNorm`、`FusedConvBatchNormRelu`、`AddRelu`
+- `MaxPool`、`GlobalAveragePool`、`Gemm`
+- `Flatten` 零拷贝 view
+
+内置 FP16 Transformer 实现包括 Tensor Core `Gemm`、`Gelu`、`Add`、
+`LayerNormalization`、`GemmGelu` 和 `SkipLayerNormalization`。矩阵乘使用 `tl.dot`、
+二维 blocking、grouped program ordering 与 4 组 AOT tile 配置。
+
+每个计算 op 当前生成 `warps2` 和 `warps4` 两个 AOT 变体。融合节点还会得到可执行的
+非融合候选，调优以完整候选序列为单位计时。
+
+## 当前限制
+
+- 单 NVIDIA GPU，Compute Capability 8.0+。
+- FP32 CNN 与受限 FP16 Transformer FFN；图像 Tensor 为 NCHW，卷积权重为 OIHW。
+- 动态 shape 必须落在明确的 min/opt/max profile 内。
+- CUDA 输入输出必须已在同一 `device_id`，Runtime 不自动插入 H2D/D2H 节点。
+- 不支持跨设备 CPU fallback、TF32/INT8/FP8、完整 Attention/KV Cache 或多 GPU。
+- `cpu_reference` 生产后端尚未实现真实 C++ 算子，会返回 `Unsupported`。
+- Python 轻量 API 尚未通过 pybind11 连接原生 C++ Engine。
+
+## Kernel Pack v2
+
+开启 CUDA 构建时，CMake 调用薄入口
+[`tools/build_triton_kernels.py`](tools/build_triton_kernels.py)。真正的 SDK 和 Kernel
+分别位于：
+
+- [`python/cutriton/kernel_sdk/`](python/cutriton/kernel_sdk/)：`KernelSpec`、校验与 pack builder。
+- [`python/cutriton/triton_kernels/`](python/cutriton/triton_kernels/)：Triton 实现模块。
+
+产物结构：
+
+```text
+triton_kernels/
+  ├─ pack.json
+  ├─ kernels/
+  │   └─ <kernel_id>/<variant_id>.ptx
+  └─ tuning/                         # 默认调优缓存目录
+      └─ <tuning_key>.json
+```
+
+`pack.json` 保存 pack/生成器/Triton/ABI 版本，Kernel 与 variant ID，有序参数 ABI，
+安全参数来源，dtype/layout/rank/Attribute 约束，grid、warp、shared memory、目标 SM、
+符号、PTX 路径和 SHA-256。v2 grid 是受限 AST，支持 literal、输入/输出维度、numel、
+`ceil_div`、`mul` 和 variant launch metadata。C++ Loader 兼容历史 v1，同时严格拒绝
+未知表达式、非法字段和越界索引。Triton 版本会进入调优和产物身份。
 
 ## 快速开始
 
-### 1. Windows CPU-only 构建
+### WSL2 + CUDA（主线）
 
-需要 CMake 和支持 C++17 的 MSVC 或 MinGW：
-
-```powershell
-cmake -S . -B build `
-  -DCUTRITON_BUILD_TESTS=ON `
-  -DCUTRITON_ENABLE_CUDA=OFF
-cmake --build build
-ctest --test-dir build --output-on-failure
-```
-
-CPU-only 测试使用显式 MockBackend 验证编译、内存规划、绑定、生命周期和注册表，
-不把未实现的 `cpu_reference` 当作数值成功。
-
-### 2. Windows + WSL2 CUDA 自动安装
-
-项目提供两阶段安装脚本。第一步需要管理员 PowerShell：
+首次安装由管理员 PowerShell 执行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\install_wsl.ps1 `
   -StorageRoot G:\Ubuntu_
 ```
 
-重启 Windows 并首次打开 Ubuntu 后，在普通 PowerShell 中执行：
+重启、首次进入 Ubuntu 完成初始化后，在普通 PowerShell 执行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\run_wsl_setup.ps1
 ```
 
-脚本会完成以下工作：
-
-1. 安装 Ubuntu 构建工具、CMake 和 Ninja。
-2. 验证 WSL 可以访问 Windows NVIDIA 驱动。
-3. 只安装 `cuda-toolkit-13-0`，不安装 Linux NVIDIA 驱动。
-4. 创建 `$HOME/.venvs/cutriton`。
-5. 安装 PyTorch 2.11、Triton 3.6 和开发依赖。
-6. 离线生成 PTX/manifest，构建 C++ CUDA 目标并运行测试。
-
-默认存储位置：
+项目约定所有大型持久数据位于 `G:\Ubuntu_`：
 
 ```text
-G:\Ubuntu_\Distro\ext4.vhdx                 WSL Linux 文件系统
-G:\Ubuntu_\wsl-swap.vhdx                    WSL swap
-G:\Ubuntu_\CUTriton\build-wsl-cuda         CUDA 构建与 Kernel 产物
+G:\Ubuntu_\Distro\ext4.vhdx
+G:\Ubuntu_\wsl-swap.vhdx
+G:\Ubuntu_\CUTriton\build-wsl-cuda
+G:\Ubuntu_\CUTriton\build-wsl-cpu
 ```
 
-可以通过 `CUTRITON_STORAGE_ROOT` 或 `CUTRITON_BUILD_DIR` 覆盖 Linux 构建位置。
+日常构建和测试：
 
-> WSL 直接使用 Windows 主机提供的 NVIDIA 驱动。不要在 WSL 中安装 `cuda`、
-> `cuda-drivers` 或 Linux 显卡驱动包，只安装 `cuda-toolkit-*`。
+```bash
+source /root/.venvs/cutriton/bin/activate
+cd /mnt/g/CUTriton/CUTriton
+cmake --build /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda --parallel
+ctest --test-dir /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda --output-on-failure
+python -m pytest tests/python -q
+```
 
-### 3. 已配置 WSL 环境中的日常开发
+WSL 使用 Windows 主机的 NVIDIA 驱动；不要在 WSL 安装 Linux `cuda-drivers`，只安装
+CUDA Toolkit。
 
-先从 Windows 终端进入 Ubuntu：
+### CPU-only
+
+CPU-only 构建不查找 CUDA、Triton 或 PyTorch：
 
 ```powershell
-wsl -d Ubuntu
+cmake -S . -B G:\Ubuntu_\CUTriton\build-cpu `
+  -DCUTRITON_ENABLE_CUDA=OFF `
+  -DCUTRITON_BUILD_BENCHMARKS=OFF `
+  -DCUTRITON_BUILD_TESTS=ON
+cmake --build G:\Ubuntu_\CUTriton\build-cpu
+ctest --test-dir G:\Ubuntu_\CUTriton\build-cpu --output-on-failure
 ```
 
-然后在 Ubuntu 中执行：
+架构测试使用显式 `MockBackend`，不会把未实现的 CPU 计算伪装为成功。
 
-```bash
-source "$HOME/.venvs/cutriton/bin/activate"
-cd /mnt/g/CUTriton/CUTriton
-
-cmake --build /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda --parallel
-ctest --test-dir /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda \
-  --output-on-failure
-```
-
-如需在其他 Linux 环境手动配置：
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install "torch==2.11.0" \
-  --index-url https://download.pytorch.org/whl/cu130
-python -m pip install -e ".[dev,triton]"
-
-cmake -S . -B build-cuda -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCUTRITON_BUILD_TESTS=ON \
-  -DCUTRITON_ENABLE_CUDA=ON \
-  -DPython3_EXECUTABLE="$PWD/.venv/bin/python"
-cmake --build build-cuda --parallel
-ctest --test-dir build-cuda --output-on-failure
-```
-
-## C++ 使用流程
-
-公共聚合头为：
+## C++ 使用示例
 
 ```cpp
 #include <cutriton/cutriton.h>
-```
 
-典型生命周期如下：
-
-```cpp
 cutriton::Model model;
-// 1. 向 model.graph() 添加输入、节点和输出。
-// 2. 用 model.AddConstant() 添加静态 Host 权重。
+// 构建 model.graph()，并用 model.AddConstant() 写入静态 Host 权重。
 
 cutriton::CompileOptions options;
 options.target = "cuda_triton";
 options.device_id = 0;
-options.kernel_artifact_dir = "/path/to/build/triton_kernels";
+options.kernel_artifact_paths = {
+    "/mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/triton_kernels"};
+options.tuning_cache_dir =
+    "/mnt/g/Ubuntu_/CUTriton/tuning-cache";
+options.tuning_mode = cutriton::TuningMode::kUseCache;
 options.enable_cuda_graph = true;
+options.cuda_graph_cache_capacity = 4;
 options.enable_profiling = true;
 
 std::unique_ptr<cutriton::Engine> engine;
 cutriton::Status status = cutriton::BuildEngine(model, options, &engine);
-if (!status.ok()) {
-  std::cerr << status.ToString() << '\n';
-  return 1;
-}
+if (!status.ok()) return 1;
 
 auto context = engine->CreateExecutionContext();
-// 3. 分配同一 device_id 上的 CUDA Buffer，并 BindInput/BindOutput。
-// 4. context->Run()，或 RunAsync(stream) 后调用 Synchronize()。
-// 5. Synchronize() 后读取 context->profiler().events()。
+// 绑定目标 GPU 上的 Tensor。
+context->BindInput("input", input);
+context->BindOutput("output", output);
+context->Run();
 ```
 
-完整的可执行构图、权重上传、输入输出绑定、CUDA Graph replay、重新绑定和外部 Stream
-示例见 [`tests/cpp/test_cuda.cpp`](tests/cpp/test_cuda.cpp)。
+动态 shape 配置：
 
-## Python 参考门面
+```cpp
+cutriton::ShapeProfile profile;
+profile.name = "images";
+profile.inputs["input"] = {
+    {1, 3, 160, 160},
+    {1, 3, 224, 224},
+    {2, 3, 256, 256},
+};
+options.shape_profiles = {profile};
 
-Python 包目前用于 API 形态验证、JSON/ONNX 结构读取和参考算子，不会调用原生 C++
-CUDA Engine。不要用这条路径评估 CUTriton GPU 性能。
+// 一个 profile 时 Context 自动选择；多个 profile 时先 SelectShapeProfile。
+context->SetInputShape("input", {1, 3, 192, 192});
+context->ResolveShapes();
+const auto* output_desc = context->GetResolvedTensorDesc("output");
+```
+
+`Run()` 等价于 `RunAsync(nullptr) + Synchronize()`。`RunAsync()` 也接受外部
+`CUstream`；同一 Context 只允许一个未完成任务，多个 Context 可以并行。
+
+## 自动调优语义
+
+| 模式 | 行为 |
+| --- | --- |
+| `kDisabled` | 使用 manifest 默认变体 |
+| `kUseCache` | 使用精确缓存；miss 时使用默认/profile opt 选择，不现场测量 |
+| `kTuneOnMiss` | 对已有 AOT 候选现场计时并写缓存，不启动 Python 编译 |
+| `kForceRetune` | 忽略旧值，重新测量并原子覆盖 |
+
+默认预热 5 次、测量 20 次并取中位数。首次选择会把各候选输出复制到 Host，与确定性
+基线比较；FP32 默认 `1e-4`，FP16 默认 `1e-2`。缓存键包含 op/融合方案、完整属性、shape、
+dtype/layout、GPU UUID/SM、Driver、pack、PTX、生成器、Triton 和 ABI 身份；每个 key
+一个 JSON 文件，通过临时文件和原子 rename 写入。
+
+## ResNet-50 正确性与性能
+
+完整链路为 stem、4 个 Bottleneck stage、GAP、Flatten view 和 Gemm。测试使用确定性
+权重，与 PyTorch FP32 使用相同输入和参数；正确性阈值为 `atol=1e-4, rtol=1e-4`。
+
+RTX 4060、FP32 batch=1、NCHW 224×224，5 次预热/20 次测量：
+
+| 实现 | CUDA Event 延迟 | 相对 PyTorch |
+| --- | ---: | ---: |
+| PyTorch 2.11 eager / cuDNN | 3.2476 ms | 1.00× |
+| CUTriton / CUDA Graph | 39.2066 ms | 12.07× slower |
+
+CUTriton Engine 建立约 `99.37 ms`，1000 维输出最大绝对误差 `6.98e-9`。当前直接
+卷积 Kernel 为每个输出遍历 C×R×S，尚无块化矩阵乘、Tensor Core 或充分形状特化，
+因此这只是可复现的优化基线，不代表 Triton 的性能上限，也不设置“必须快于 cuDNN”
+的测试断言。
+
+复现：
 
 ```bash
-python -m pip install -e ".[dev]"
+python benchmarks/resnet50_compare.py \
+  --executable /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/cutriton_resnet50_benchmark \
+  --warmup 5 --iterations 20
 ```
 
-```python
-import cutriton
+## Transformer FFN 正确性与性能
 
-engine = cutriton.compile("demo/gelu_graph.json", target="cpu_reference")
-context = engine.create_context()
-result = context.run({"x": [-1.0, 0.0, 1.0]})
-print(result["y"])
-```
+基准使用 BERT-tiny 的 `H=128, I=512`，并覆盖非整块 token 数。RTX 4060、
+`tokens=1024`、FP16、50 次预热/200 次测量的当前基线：
 
-当前 Python 参考执行覆盖 `Identity`、`Relu`、`Gelu`、`Softmax`、
-`LayerNormalization` 和 `Add`。ONNX 路径目前只读取图结构，不是完整 lowering。
+| 实现 | CUDA Event 延迟 | 说明 |
+| --- | ---: | --- |
+| AOT `GemmGelu` 融合候选 | 0.033728 / 0.038912 ms | p50 / p95 |
+| AOT 未融合候选 | 0.038848 / 0.044704 ms | 融合 p50 延迟降低约 13.2% |
+| ONNX Runtime CUDA 子图 | 0.113728 / 0.143360 ms | AOT 融合快约 3.372x |
+| PyTorch eager | 0.030816 / 0.031712 ms | 仍快于当前 AOT |
 
-运行 Python 测试与轻量 benchmark：
+最大绝对误差为 `9.77e-4`，Engine 建立中位数约 `298.4 ms`。这里达到的是 FFN 子图
+相对 ORT 超过 20% 的门槛，不代表 BERT 整图加速；融合相对未融合约为 `1.154x`。
+本次运行的原始数据见 [`reports/rtx4060/transformer_ffn_8978d9f.json`](reports/rtx4060/transformer_ffn_8978d9f.json)。
 
 ```bash
-python -m pytest tests/python -q
-python benchmarks/plan_latency.py \
-  --model demo/gelu_graph.json \
-  --target cpu_reference
+python benchmarks/transformer_ffn_compare.py \
+  --executable /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/cutriton_transformer_ffn_benchmark \
+  --tokens 1024 --warmup 50 --iterations 200 \
+  --rounds 5 --json /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/transformer_ffn_report.json
 ```
 
-该 benchmark 测量 Python 参考路径，不代表 C++/CUDA/Triton 延迟。
+安装 Nsight Systems/Compute 后可生成 `.nsys-rep`、`.ncu-rep` 和 CSV 摘要：
 
-## Triton Kernel 产物
-
-开启 `CUTRITON_ENABLE_CUDA` 后，CMake 会调用
-[`tools/build_triton_kernels.py`](tools/build_triton_kernels.py)，生成：
-
-```text
-triton_kernels/
-  ├─ FusedConvBatchNormRelu.ptx
-  ├─ GlobalAveragePool.ptx
-  ├─ Gemm.ptx
-  └─ manifest.json
+```bash
+bash tools/profile_transformer_ffn.sh \
+  /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/cutriton_transformer_ffn_benchmark \
+  /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/nsight-transformer 1024
 ```
-
-manifest 固定记录 schema、Triton 版本、op type、符号、完整参数 ABI、dtype/layout、
-最低 Compute Capability、warp 数、共享内存和 PTX SHA-256。运行时在创建 Kernel
-前检查 schema/Triton 版本、op、符号、PTX 文件与哈希、dtype/layout 和设备能力，
-并使用 manifest 中的启动配置，通过 `cuModuleLoadDataEx`、`cuModuleGetFunction` 和
-`cuLaunchKernel` 执行 PTX。
-
-Triton 3.6 会在用户参数后追加两个运行时指针参数；生成器和 C++ launcher 都显式
-维护这段 ABI，避免 PTX 参数表与 Driver launch 参数不一致。
 
 ## 测试覆盖
 
-### CPU-only 架构测试
+- KernelSpec 注册、ABI 顺序、安全 source/grid/constraint AST。
+- v1/v2 pack 兼容、非法 grid AST/metadata、PTX SHA 损坏、SM 不兼容和缺失产物。
+- OpSchema、FusionRegistry、注册表并发和 Engine/Context 生命周期。
+- 256 B 对齐、best-fit、Flatten alias、候选临时空间和真实 Workspace view。
+- Module Cache：同一 PTX 在多节点、多 Context 中只加载一次。
+- 调优数值检查、cache hit 不重复测量、产物/GPU/shape 进入缓存键。
+- profile min/opt/max、越界 shape、运行时输出 shape 和最大 Workspace。
+- 不同 shape/绑定地址的 CUDA Graph LRU、内部/外部 stream、异步限制。
+- ResNet Stem、动态 H/W 和完整 ResNet-50 与 PyTorch 对齐。
+- FP16 Transformer 奇数边界 shape、融合/未融合候选与 CPU 参考对齐。
+- Linux CPU-only 与 WSL2 CUDA 构建。
 
-- Tensor/Buffer 和常量描述校验。
-- Graph Pass 与 BatchNorm epsilon 保留。
-- 256 字节对齐、best-fit 复用和 Flatten alias。
-- KernelRegistry 并发注册与重复注册。
-- EngineState/Context 生命周期。
-- 输入输出名称、描述、设备和 Buffer 边界。
-- 单个 Context 的 pending run 限制。
-- profiling 开关行为。
+## 扩展方式
 
-### WSL2 GPU 集成测试
+### 为已有 IR op 增加 Kernel 或变体
 
-- 缺失 Triton 产物和 SM 不兼容时编译失败。
-- 常量权重上传和 CUDA Workspace 实际接线。
-- 三个真实 Triton Kernel 与 Flatten view。
-- CUDA Graph capture/replay 和重新绑定后重新捕获。
-- 内部 Stream 与外部 `CUstream`。
-- CUDA Event profiling。
-- ResNet Stem 风格输出与 PyTorch FP32 对齐。
+1. 在 `python/cutriton/triton_kernels/` 定义 Triton Kernel。
+2. 注册 `KernelSpec`，声明有序参数来源、grid、约束和 variants。
+3. 用 `--module` 让薄 CLI 发现模块并生成 pack。
+4. 加入 round-trip、错误产物和数值测试。
 
-当前本机测试结果：
+不需要修改 `ExecutionContext`、通用参数绑定器或 CUDA launcher。
 
-```text
-cutriton_core_tests                 Passed
-cutriton_cuda_tests                 Passed
-cutriton_cuda_pytorch_reference     Passed
-tests/python                        1 passed
-```
+### 增加新的 IR op
+
+1. 在 C++ 注册 `OpSchema`，定义输入输出数量、Attribute 校验和 shape 函数。
+2. 如有等价融合方案，在 `FusionRegistry` 注册候选。
+3. 在 Python 注册对应 `KernelSpec`。
+4. 增加编译期和 GPU correctness 测试。
+
+仍不需要新增 C++ 专用 launcher。当前 `src/backend/backend.cpp` 中为内置融合候选构造
+临时值的代码下一步会继续数据驱动化。
 
 ## 仓库导航
 
 | 路径 | 作用 |
 | --- | --- |
-| [`include/cutriton/`](include/cutriton/) | 公共 C++ API；每个模块都有 README |
-| [`src/`](src/) | Core、IR、Backend、Compiler 和 Runtime 实现 |
-| [`python/cutriton/`](python/cutriton/) | Python 参考门面和算子实验区 |
-| [`tools/`](tools/) | WSL/CUDA 安装脚本和 Triton 离线生成器 |
-| [`tests/cpp/`](tests/cpp/) | CPU 架构测试与真实 CUDA 集成测试 |
-| [`tests/python/`](tests/python/) | Python API 与 PyTorch 数值参考测试 |
-| [`demo/`](demo/) | 最小 JSON IR 示例 |
-| [`benchmarks/`](benchmarks/) | benchmark 框架；当前主要覆盖 Python 参考路径 |
+| [`include/cutriton/`](include/cutriton/) | 公共 C++ API |
+| [`src/`](src/) | IR、Compiler、Backend、Runtime 实现 |
+| [`python/cutriton/kernel_sdk/`](python/cutriton/kernel_sdk/) | AOT Kernel SDK 与 pack builder |
+| [`python/cutriton/triton_kernels/`](python/cutriton/triton_kernels/) | Triton Kernel 模块 |
+| [`python/cutriton/kernels/`](python/cutriton/kernels/) | Python 数值参考算子 |
+| [`tools/`](tools/) | WSL 安装和薄构建 CLI |
+| [`tests/`](tests/) | CPU、CUDA、SDK 与 PyTorch 对照测试 |
+| [`benchmarks/`](benchmarks/) | ResNet-50 和轻量 Python benchmark |
 | [`docs/`](docs/) | 架构与开发文档 |
 
-公共模块入口：
+## 下一阶段
 
-- [`core`](include/cutriton/core/README.md)：Status、Device、Tensor、Buffer。
-- [`ir`](include/cutriton/ir/README.md)：Model、Graph、Node、Value 和 Pass。
-- [`backend`](include/cutriton/backend/README.md)：Backend、OpKernel 和注册表。
-- [`compiler`](include/cutriton/compiler/README.md)：CompileOptions、Compiler 和
-  BuildEngine。
-- [`runtime`](include/cutriton/runtime/README.md)：ExecutablePlan、MemoryPlanner、
-  Engine、ExecutionContext 和 Profiler。
+1. 优化 Conv/Gemm：blocking、shared memory、Tensor Core、更多 shape 特化。
+2. 补齐独立 `AutoTuner`/融合策略层的离线工具和 profile min/opt/max 预调优。
+3. 实现原生 ONNX importer 和 C++ CPU reference backend。
+4. 用 pybind11 连接 Python API 与原生 Engine。
+5. 扩展 FP16/TF32、`cudaMallocAsync` 内存池和安装/发布流程。
 
-## 新增一个 CUDA 算子的基本步骤
-
-1. 在 IR 中确定 op type、输入输出和 Attribute 约定。
-2. 在 `src/ir/pass.cpp` 增加形状推导或规范化规则。
-3. 在 Triton 生成器中实现 Kernel 并把完整 ABI 写入 manifest。
-4. 在 `Backend::CheckSupport()` 中校验 dtype、shape、layout、属性和设备能力。
-5. 在 CUDA Kernel launcher 中按相同 ABI 组织参数。
-6. 增加 Python/PyTorch 参考结果和 C++ GPU 集成测试。
-7. 更新模块 README，明确支持范围和限制。
-
-## 路线图
-
-下一阶段按以下顺序推进：
-
-1. 实现原生 ONNX importer，把 initializer 和属性完整映射到 C++ IR。
-2. 实现真实 C++ CPU reference Kernel，形成与 CUDA 后端独立的数值基线。
-3. 使用 pybind11 让 Python `Engine` 包装原生 C++ Engine。
-4. 扩展 FP16/TF32、更多 ResNet-50 算子和通用算子覆盖。
-5. 加入 Kernel 自动调优、模块缓存、`cudaMallocAsync` 和显存池。
-6. 建立 PyTorch Eager、ONNX Runtime CUDA 与 CUTriton 的可复现性能报告。
-7. 增加安装规则、CMake package export、Python wheel 和稳定的动态库导出宏。
-
-在可复现 benchmark 产出前，项目不会宣称固定性能提升比例。
-
-## 常见问题
-
-### 为什么不支持原生 Windows Triton？
-
-当前 CUDA/Triton 主线以 Linux 为支持平台，因此 Windows 开发使用 WSL2；Windows
-本机构建用于 CPU-only API 和架构测试。
-
-### 为什么不能自动回退到 CPU？
-
-CUDA 与 CPU 节点之间需要显式数据搬运、同步和新的生命周期规划。在这些语义实现前，
-直接 fallback 会产生看似成功但数据错误的混合设备图，因此当前选择明确失败。
-
-### 为什么 Python `compile()` 没有使用 C++ Engine？
-
-pybind11 桥接尚未实现。Python 侧目前刻意保持为轻量参考门面，原生执行入口是 C++
-`Compiler`、`Engine` 和 `ExecutionContext`。
-
-### CUDA 编译提示找不到 Kernel 产物怎么办？
-
-确保先构建 `cutriton_triton_kernels`，并把
-`CompileOptions::kernel_artifact_dir` 指向包含 `manifest.json` 与 PTX 的目录。
-
-## 许可证
+## 许可证与资料
 
 CUTriton 使用 [MIT License](LICENSE)。
 
-## 相关资料
-
 - [Triton 官方文档](https://triton-lang.org/)
+- [NVIDIA CUDA Driver API](https://docs.nvidia.com/cuda/cuda-driver-api/)
 - [Microsoft WSL 安装文档](https://learn.microsoft.com/windows/wsl/install)
 - [NVIDIA CUDA on WSL 指南](https://docs.nvidia.com/cuda/wsl-user-guide/)

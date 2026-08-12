@@ -7,10 +7,10 @@
 
 - `cutriton/cutriton.h`：聚合全部公共 API 的入口头文件。
 - `cutriton/core/`：状态、设备、Tensor 描述和 Buffer。
-- `cutriton/ir/`：Model、Graph、Node、Value 和 Graph Pass。
-- `cutriton/backend/`：后端能力检查、Kernel 抽象和注册表。
+- `cutriton/ir/`：Model、Graph、OpSchema、FusionRegistry 和 Graph Pass。
+- `cutriton/backend/`：Kernel Pack、Catalog、Lowering、Invocation 和注册表。
 - `cutriton/compiler/`：从 Model 到 ExecutablePlan/Engine 的编译入口。
-- `cutriton/runtime/`：执行计划、内存规划、Engine、Context 和 profiling。
+- `cutriton/runtime/`：执行计划、ShapeProfile、调优、内存规划、Engine、Context 和 profiling。
 
 ## 边界约定
 

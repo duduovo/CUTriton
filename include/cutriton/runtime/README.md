@@ -1,28 +1,13 @@
 # include/cutriton/runtime
 
-本目录定义执行已编译 Plan 所需的公共接口。运行期不再改变 Graph 的计算语义。
+Runtime 执行已 Lower 的 Plan，不修改图语义。
 
-## ExecutablePlan
+- `ExecutablePlan`：Graph、候选 Invocation、常量、MemoryPlan/ProfilePlan 和运行配置。
+- `Engine`/共享 EngineState：Plan、常量显存、PTX Module/Function Cache。
+- `ExecutionContext`：shape/profile、绑定、Workspace、stream、调优选择、Graph LRU、Event。
+- `MemoryPlanner`：256 B 对齐、best-fit、alias 和候选临时 scratch。
+- `TuningMode`/`ShapeProfile`：AOT 候选选择和有限动态 shape 公共契约。
 
-Plan 保存优化后的 Graph、拓扑有序的 `PlanOp`、常量 Host Tensor、目标设备、Kernel
-产物目录、Workspace 规划以及 CUDA Graph/profiling 开关。交给 Engine 后应按只读
-对象使用。
-
-## Engine 与 ExecutionContext
-
-- `Engine` 通过共享的 EngineState 持有 Plan 和设备常量。
-- `ExecutionContext` 独占 Stream、Workspace、中间 Tensor、CUDA Graph 和 Event；
-  Context 可以晚于创建它的 Engine 销毁。
-- 单个 Context 非线程安全且只允许一个未完成任务；多个 Context 可以并行执行。
-- `BindInput()`/`BindOutput()` 严格校验名称、shape、dtype、layout、设备、device ID
-  和 Buffer 边界。重新绑定会使已有 CUDA Graph 失效。
-- `Run()` 等价于 `RunAsync(nullptr) + Synchronize()`；`RunAsync()` 也可接收外部
-  `CUstream`。
-
-## 内存与计时
-
-`MemoryPlanner` 排除图输入输出和常量，按 256 字节对齐对中间 Tensor 做 best-fit
-复用，并传播 Flatten alias 生命周期。启用 profiling 时 CUDA Kernel 使用 GPU
-Event 计时，Flatten 记录零耗时 view 事件；关闭时事件列表为空。
-
-具体实现位于 `src/runtime/`。
+一个 profile 时自动选择；多个 profile 需调用 `SelectShapeProfile`。随后通过
+`SetInputShape`、`ResolveShapes` 和 `GetResolvedTensorDesc` 获取本次具体描述。
+`Run()` 等价于 `RunAsync(nullptr) + Synchronize()`。

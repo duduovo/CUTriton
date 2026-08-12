@@ -1,0 +1,6 @@
+@echo off
+echo Starting vcvars...
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+echo vcvars completed, running cmake...
+cmake -S . -B build -DCUTRITON_BUILD_TESTS=ON
+echo cmake exit code: %ERRORLEVEL%

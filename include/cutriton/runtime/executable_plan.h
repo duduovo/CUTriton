@@ -7,6 +7,8 @@
 #include "cutriton/backend/backend.h"
 #include "cutriton/ir/graph.h"
 #include "cutriton/runtime/memory_planner.h"
+#include "cutriton/runtime/tuning.h"
+#include "cutriton/runtime/shape_profile.h"
 
 namespace cutriton {
 
@@ -19,6 +21,16 @@ struct PlanOp {
   std::string backend_name;
   std::vector<std::string> inputs;
   std::vector<std::string> outputs;
+  std::vector<ExecutionCandidate> candidates;
+  std::size_t selected_candidate{0};
+};
+
+struct ProfilePlan {
+  ShapeProfile profile;
+  Graph min_graph;
+  Graph opt_graph;
+  Graph max_graph;
+  MemoryPlan max_memory_plan;
 };
 
 // Model 经 Graph Pass、后端选择和内存规划后得到的完整可执行快照。
@@ -53,6 +65,18 @@ class ExecutablePlan {
   // 关闭 profiling 时不创建计时 Event，Profiler 的 events() 保持为空。
   bool enable_profiling() const { return enable_profiling_; }
   void set_enable_profiling(bool value) { enable_profiling_ = value; }
+  const TuningConfig& tuning_config() const { return tuning_config_; }
+  TuningConfig& mutable_tuning_config() { return tuning_config_; }
+  std::size_t cuda_graph_cache_capacity() const {
+    return cuda_graph_cache_capacity_;
+  }
+  void set_cuda_graph_cache_capacity(std::size_t value) {
+    cuda_graph_cache_capacity_ = value;
+  }
+  const std::vector<ProfilePlan>& profile_plans() const {
+    return profile_plans_;
+  }
+  std::vector<ProfilePlan>& mutable_profile_plans() { return profile_plans_; }
 
  private:
   Graph graph_;
@@ -63,6 +87,9 @@ class ExecutablePlan {
   std::unordered_map<std::string, Tensor> constants_;
   bool enable_cuda_graph_{false};
   bool enable_profiling_{false};
+  TuningConfig tuning_config_;
+  std::size_t cuda_graph_cache_capacity_{4};
+  std::vector<ProfilePlan> profile_plans_;
 };
 
 }  // namespace cutriton

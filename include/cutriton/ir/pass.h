@@ -46,11 +46,25 @@ std::unique_ptr<GraphPass> CreateConstantFoldingPass();
 std::unique_ptr<GraphPass> CreateDeadNodeEliminationPass();
 //把连续的 Conv、BatchNormalization、ReLU 合并成一个节点
 std::unique_ptr<GraphPass> CreateConvBatchNormReluFusionPass();
+//把残差分支末尾的 Add、Relu 合并成一个节点
+std::unique_ptr<GraphPass> CreateAddReluFusionPass();
+/// 创建 Gemm + Gelu -> GemmGelu 模式融合 Pass。
+/// 仅当 Gemm 输出只有目标 Gelu 一个消费者且不是图输出时才执行融合。
+/// \return 用于执行 GemmGelu 模式匹配与图改写的 GraphPass。
+std::unique_ptr<GraphPass> CreateGemmGeluFusionPass();
+/// 创建 Add + LayerNormalization -> SkipLayerNormalization 模式融合 Pass。
+/// 仅融合满足单消费者等安全约束的残差归一化子图，避免改变图的原有语义。
+/// \return 用于执行 SkipLayerNormalization 模式匹配与图改写的 GraphPass。
+std::unique_ptr<GraphPass> CreateSkipLayerNormalizationFusionPass();
 //把多种相似写法转换成项目内部统一的写法
 std::unique_ptr<GraphPass> CreateFlattenGemmNormalizationPass();
 //检查最终 Tensor 描述是否合法
 std::unique_ptr<GraphPass> CreateStaticShapeValidationPass();
 
-PassManager CreateDefaultCompilePasses();
+/// 组装 Compiler 使用的默认优化流水线。
+/// \param enable_transformer_fusions 是否加入 Transformer 融合 Pass；关闭后可用于
+/// 正确性调试以及融合前后的性能基准对比。
+/// \return 按默认执行顺序配置完成的 PassManager。
+PassManager CreateDefaultCompilePasses(bool enable_transformer_fusions = true);
 
 }  // 命名空间 cutriton

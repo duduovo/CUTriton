@@ -6,10 +6,10 @@
 ## 模块
 
 - `core/`：Status、Tensor 和 Host/CUDA Buffer。
-- `ir/`：Graph 操作、形状推导和默认优化 Pass。
-- `backend/`：线程安全注册表、Triton manifest/PTX 加载及 CUDA Kernel 启动。
-- `compiler/`：复制 Model、运行 Pass、检查后端并构建 ExecutablePlan。
-- `runtime/`：内存规划、Engine/Context、Stream、CUDA Graph 和 profiling。
+- `ir/`：Graph、OpSchema、FusionRegistry 和默认优化 Pass。
+- `backend/`：Kernel Pack 仓库/目录、编译期 Lowering、参数绑定和通用 CUDA launcher。
+- `compiler/`：运行 Pass、生成候选和 profile，并构建 ExecutablePlan。
+- `runtime/`：内存规划、调优、Engine/Context、Stream、CUDA Graph LRU 和 profiling。
 
 ## 实现边界
 
@@ -17,4 +17,4 @@
   Driver，并对 CUDA 操作返回明确错误。
 - 生产路径没有 NoOp Kernel。缺少真实实现、产物不匹配或设备不受支持时必须失败。
 - `tests/cpp/` 验证公共行为，测试替身应显式实现为 MockBackend，不进入生产后端。
-- Python/Triton 源码和离线构建工具分别位于 `python/` 与 `tools/`，不放入本目录。
+- Triton 定义和 Kernel SDK 位于 `python/cutriton/`；`tools/` 只保留薄 CLI 和环境脚本。

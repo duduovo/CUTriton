@@ -41,6 +41,11 @@ class ExecutionContext {
   // 重新绑定会使已经捕获的 CUDA Graph 失效，并在下次运行时重新捕获。
   Status BindInput(const std::string& name, Tensor tensor);
   Status BindOutput(const std::string& name, Tensor tensor);
+  Status SelectShapeProfile(const std::string& name);
+  Status SetInputShape(const std::string& name,
+                       std::vector<int64_t> shape);
+  Status ResolveShapes();
+  const TensorDesc* GetResolvedTensorDesc(const std::string& name) const;
   // 同步执行，语义等价于 RunAsync(nullptr) 后调用 Synchronize()。
   Status Run();
   // 将计算提交到 stream。CUDA 下传 nullptr 表示使用 Context 的内部 Stream；
@@ -52,6 +57,8 @@ class ExecutionContext {
 
   // CUDA profiling 结果只有在成功 Synchronize() 后才是本次执行的完整结果。
   const Profiler& profiler() const { return profiler_; }
+  std::size_t cached_cuda_graph_count() const;
+  std::size_t loaded_cuda_module_count() const;
   // 暴露当前 Tensor 视图用于诊断；其 Buffer 生命周期由 Context 管理。
   const std::unordered_map<std::string, Tensor>& tensors() const {
     return tensors_;
@@ -60,15 +67,24 @@ class ExecutionContext {
  private:
   // 以下准备步骤采用惰性初始化，同一个 Context 后续执行会复用相关资源。
   Status PrepareKernels();
+  Status PrepareTuning();
   Status PrepareTensors();
   Status ValidateBindings() const;
   void InvalidateCudaGraph();
+  const Graph& ActiveGraph() const;
+  const MemoryPlan& ActiveMemoryPlan() const;
 
   std::shared_ptr<EngineState> state_;
   bool kernels_prepared_{false};
   bool tensors_prepared_{false};
   bool run_pending_{false};
-  std::vector<std::unique_ptr<OpKernel>> kernels_;
+  bool tuning_prepared_{false};
+  std::vector<std::size_t> selected_candidates_;
+  int selected_profile_{-1};
+  std::unordered_map<std::string, std::vector<int64_t>> input_shapes_;
+  Graph resolved_graph_;
+  bool shapes_resolved_{false};
+  std::vector<std::vector<std::unique_ptr<OpKernel>>> kernels_;
   std::unordered_map<std::string, Tensor> tensors_;
   std::shared_ptr<Buffer> workspace_;
   Profiler profiler_;

@@ -1,0 +1,131 @@
+{
+  "cutriton_vs_ort": 3.37191655934988,
+  "max_abs_error": 0.0009765625,
+  "mean_abs_error": 0.00014903140254318714,
+  "methodology": {
+    "iterations": 200,
+    "rounds": 5,
+    "seed": 20260811,
+    "timing": "CUDA events; H2D/D2H excluded",
+    "warmup": 50
+  },
+  "native": {
+    "compile_ms": 298.397,
+    "fused_ms": 0.033728,
+    "fused_p95_ms": 0.038912,
+    "fusion_speedup": 1.1537,
+    "rounds": [
+      {
+        "compile_ms": 305.887,
+        "fused_ms": 0.033792,
+        "fused_p95_ms": 0.038912,
+        "fusion_speedup": 1.14962,
+        "unfused_ms": 0.038848,
+        "unfused_p95_ms": 0.044704
+      },
+      {
+        "compile_ms": 298.583,
+        "fused_ms": 0.033664,
+        "fused_p95_ms": 0.038912,
+        "fusion_speedup": 1.15399,
+        "unfused_ms": 0.038848,
+        "unfused_p95_ms": 0.044032
+      },
+      {
+        "compile_ms": 298.397,
+        "fused_ms": 0.033728,
+        "fused_p95_ms": 0.038912,
+        "fusion_speedup": 1.1537,
+        "unfused_ms": 0.038912,
+        "unfused_p95_ms": 0.044704
+      },
+      {
+        "compile_ms": 290.769,
+        "fused_ms": 0.03376,
+        "fused_p95_ms": 0.038912,
+        "fusion_speedup": 1.14976,
+        "unfused_ms": 0.038816,
+        "unfused_p95_ms": 0.044768
+      },
+      {
+        "compile_ms": 293.386,
+        "fused_ms": 0.033696,
+        "fused_p95_ms": 0.038912,
+        "fusion_speedup": 1.32669,
+        "unfused_ms": 0.044704,
+        "unfused_p95_ms": 0.055296
+      }
+    ],
+    "unfused_ms": 0.038848,
+    "unfused_p95_ms": 0.044704
+  },
+  "ort": {
+    "median_ms": 0.11372800171375275,
+    "p95_ms": 0.14336000382900238,
+    "rounds": [
+      {
+        "median_ms": 0.11372800171375275,
+        "p95_ms": 0.14950400590896606
+      },
+      {
+        "median_ms": 0.11521599814295769,
+        "p95_ms": 0.14336000382900238
+      },
+      {
+        "median_ms": 0.11665600165724754,
+        "p95_ms": 0.14220799505710602
+      },
+      {
+        "median_ms": 0.11366400122642517,
+        "p95_ms": 0.14860799908638
+      },
+      {
+        "median_ms": 0.11366400122642517,
+        "p95_ms": 0.1340479999780655
+      }
+    ]
+  },
+  "ort_subgraph_gate": "passed",
+  "pytorch": {
+    "median_ms": 0.03081599995493889,
+    "p95_ms": 0.03171199932694435,
+    "rounds": [
+      {
+        "median_ms": 0.03081599995493889,
+        "p95_ms": 0.03171199932694435
+      },
+      {
+        "median_ms": 0.03081599995493889,
+        "p95_ms": 0.03167999908328056
+      },
+      {
+        "median_ms": 0.0307839997112751,
+        "p95_ms": 0.03174399957060814
+      },
+      {
+        "median_ms": 0.030751999467611313,
+        "p95_ms": 0.031647998839616776
+      },
+      {
+        "median_ms": 0.03081599995493889,
+        "p95_ms": 0.03171199932694435
+      }
+    ]
+  },
+  "schema_version": 1,
+  "shape": {
+    "dtype": "fp16",
+    "hidden": 128,
+    "intermediate": 512,
+    "tokens": 1024
+  },
+  "software": {
+    "cuda": "13.0",
+    "gpu": "NVIDIA GeForce RTX 4060, 610.74",
+    "onnx": "1.22.0",
+    "onnxruntime": "1.28.0",
+    "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "torch": "2.11.0+cu130"
+  }
+}

@@ -18,9 +18,10 @@ Engine 在首次准备设备资源时上传。
 
 1. 拓扑排序和形状推导。
 2. 常量折叠扩展点与死节点消除。
-3. `Conv + BatchNormalization + Relu` 融合，并保留 BatchNorm epsilon。
-4. 再次拓扑排序、形状推导。
-5. Flatten/Gemm 规范化、再次 DCE 和静态 shape 校验。
+3. `Conv + BatchNormalization (+ Relu)` 融合，并保留 BatchNorm epsilon。
+4. 残差路径的 `Add + Relu` 融合为 `AddRelu`。
+5. 再次拓扑排序、形状推导。
+6. Flatten/Gemm 规范化、再次 DCE 和静态 shape 校验。
 
 当前 `ConstantFoldingPass` 仍是扩展点，不计算新的常量数据；模型常量本身已经由
 `Model` 的常量表完整保存。具体实现位于 `src/ir/`。

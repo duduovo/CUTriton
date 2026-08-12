@@ -10,16 +10,28 @@
 #include "cutriton/core/status.h"
 #include "cutriton/core/tensor.h"
 #include "cutriton/ir/graph.h"
+#include "cutriton/backend/kernel_artifact.h"
+#include "cutriton/backend/kernel_invocation.h"
 
 namespace cutriton {
 
 class Profiler;
+class CudaModuleCache;
 
-// 后端在能力检查和 Kernel 创建阶段共享的只读配置。
-// kernel_artifact_dir 对 cuda_triton 来说必须指向 PTX 与 manifest.json 所在目录。
+// 后端在能力检查和 Lowering 阶段共享的只读配置。
+// kernel_artifact_paths 可包含一个或多个 pack.json 或其父目录。
 struct BackendOptions {
   Device device{};
+  std::vector<std::string> kernel_artifact_paths;
+  // Deprecated single-pack spelling kept as a source-compatible bridge.
   std::string kernel_artifact_dir;
+};
+
+struct LoweringContext {
+  const Graph* graph{nullptr};
+  const BackendOptions* options{nullptr};
+  const ArtifactRepository* artifacts{nullptr};
+  const KernelCatalog* catalog{nullptr};
 };
 
 // 单次算子执行所需的运行时对象。该结构及其指针只在 Compute() 调用期间有效。
@@ -41,7 +53,7 @@ class OpKernel {
   virtual Status Compute(KernelContext* context) = 0;
 };
 
-// Backend 负责判断节点能否执行，并为受支持节点创建对应的 OpKernel。
+// Backend 在编译期把 IR 节点 Lower 成声明式 ExecutionCandidate。
 class Backend {
  public:
   virtual ~Backend() = default;
@@ -50,7 +62,11 @@ class Backend {
   // 不支持时应返回带具体原因的 Status，而不是创建空操作 Kernel。
   virtual Status CheckSupport(const Node& node, const Graph& graph,
                               const BackendOptions& options) const = 0;
-  // 创建前必须采用与 CheckSupport() 相同的判定条件。
+  // Converts an IR node into artifact-backed executable candidates. The base
+  // implementation creates a legacy candidate for non-artifact test backends.
+  virtual Status Lower(const Node& node, const LoweringContext& context,
+                       std::vector<ExecutionCandidate>* candidates) const;
+  // 旧式非产物后端使用的 Kernel 工厂；CUDA 生产路径由 Invocation 工厂统一创建。
   virtual Status CreateKernel(const Node& node, const Graph& graph,
                               const BackendOptions& options,
                               std::unique_ptr<OpKernel>* kernel) const = 0;
@@ -78,5 +94,13 @@ std::shared_ptr<Backend> CreateCpuReferenceBackend();
 std::shared_ptr<Backend> CreateCudaTritonBackend();
 // 幂等注册全部内置后端，已经存在的同名内置后端会被保留。
 Status RegisterBuiltinBackends();
+
+// Artifact-backed CUDA execution is intentionally separate from IR lowering.
+Status CreateCudaModuleCache(int device_id,
+                             std::shared_ptr<CudaModuleCache>* cache);
+Status CreateInvocationKernel(const KernelInvocation& invocation, int device_id,
+                              std::shared_ptr<CudaModuleCache> cache,
+                              std::unique_ptr<OpKernel>* kernel);
+std::size_t LoadedModuleCount(const std::shared_ptr<CudaModuleCache>& cache);
 
 }  // namespace cutriton

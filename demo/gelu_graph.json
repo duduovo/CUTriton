@@ -1,0 +1,13 @@
+{
+  "name": "gelu_demo",
+  "inputs": ["x"],
+  "outputs": ["y"],
+  "nodes": [
+    {
+      "name": "gelu",
+      "op_type": "Gelu",
+      "inputs": ["x"],
+      "outputs": ["y"]
+    }
+  ]
+}
