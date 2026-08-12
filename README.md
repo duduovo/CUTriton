@@ -12,6 +12,28 @@ Cache 和 GPU profiling。
 > 项目状态：`0.1`，适合学习、架构验证和 Kernel 研究，尚不能替代 TensorRT、
 > ONNX Runtime 或 cuDNN。当前直接卷积 Kernel 以正确性为主，性能仍有明显差距。
 
+## 核心结果
+
+| 项目 | RTX 4060 实测结果 |
+| --- | ---: |
+| FP16 Transformer FFN：AOT fused / ORT CUDA 子图 | `3.372x` |
+| `GemmGelu` 融合 / 未融合候选 | `1.154x` |
+| FP16 最大绝对误差 | `9.77e-4` |
+| 当前测试矩阵 | Python `9/9`、CUDA CTest `5/5`、CPU CTest `1/1` |
+
+上述加速只对应 BERT-tiny 尺寸的 FFN 子图，不代表 BERT 整图加速；PyTorch eager
+在同一子图上仍略快于当前 AOT 实现。完整方法和原始数据见
+[Transformer FFN 正确性与性能](#transformer-ffn-正确性与性能)。
+
+## 开发分支
+
+| 分支 | 定位 |
+| --- | --- |
+| [`feature/aot-transformer-optimization`](https://github.com/duduovo/CUTriton/tree/feature/aot-transformer-optimization) | C++ AOT Runtime、Kernel Pack 与 Transformer Kernel 主线 |
+| [`feature/python-jit-runtime`](https://github.com/duduovo/CUTriton/tree/feature/python-jit-runtime) | Python JIT、ONNX Runtime 混合执行与服务化扩展 |
+
+两个分支分别验证 AOT 引擎深度和真实 ONNX 部署能力；当前 README 描述的是 AOT 主线。
+
 ## 架构
 
 ```text
@@ -67,8 +89,9 @@ C++ Model / IR（不依赖 Triton）
 `LayerNormalization`、`GemmGelu` 和 `SkipLayerNormalization`。矩阵乘使用 `tl.dot`、
 二维 blocking、grouped program ordering 与 4 组 AOT tile 配置。
 
-每个计算 op 当前生成 `warps2` 和 `warps4` 两个 AOT 变体。融合节点还会得到可执行的
-非融合候选，调优以完整候选序列为单位计时。
+FP32 ResNet Kernel 通常生成 `warps2` 和 `warps4` 两个 AOT 变体；FP16 Tensor Core
+GEMM 使用 4 组 `BLOCK_M/N/K` tile 配置，其他 Transformer Kernel 根据算子特点提供
+1 至 2 个变体。融合节点还会得到可执行的非融合候选，调优以完整候选序列为单位计时。
 
 ## 当前限制
 
@@ -135,12 +158,16 @@ G:\Ubuntu_\CUTriton\build-wsl-cpu
 日常构建和测试：
 
 ```bash
-source /root/.venvs/cutriton/bin/activate
+source "$HOME/.venvs/cutriton/bin/activate"
 cd /mnt/g/CUTriton/CUTriton
 cmake --build /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda --parallel
 ctest --test-dir /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda --output-on-failure
 python -m pytest tests/python -q
 ```
+
+安装脚本会创建虚拟环境，并安装固定版本的 PyTorch、Triton、ONNX 和 ONNX Runtime GPU
+benchmark 依赖。可通过 `CUTRITON_VENV`、`CUTRITON_STORAGE_ROOT` 和
+`CUTRITON_BUILD_DIR` 覆盖默认路径。
 
 WSL 使用 Windows 主机的 NVIDIA 驱动；不要在 WSL 安装 Linux `cuda-drivers`，只安装
 CUDA Toolkit。
@@ -149,13 +176,15 @@ CUDA Toolkit。
 
 CPU-only 构建不查找 CUDA、Triton 或 PyTorch：
 
-```powershell
-cmake -S . -B G:\Ubuntu_\CUTriton\build-cpu `
-  -DCUTRITON_ENABLE_CUDA=OFF `
-  -DCUTRITON_BUILD_BENCHMARKS=OFF `
+```bash
+cd /mnt/g/CUTriton/CUTriton
+cmake -S . -B /mnt/g/Ubuntu_/CUTriton/build-wsl-cpu -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCUTRITON_ENABLE_CUDA=OFF \
+  -DCUTRITON_BUILD_BENCHMARKS=OFF \
   -DCUTRITON_BUILD_TESTS=ON
-cmake --build G:\Ubuntu_\CUTriton\build-cpu
-ctest --test-dir G:\Ubuntu_\CUTriton\build-cpu --output-on-failure
+cmake --build /mnt/g/Ubuntu_/CUTriton/build-wsl-cpu --parallel
+ctest --test-dir /mnt/g/Ubuntu_/CUTriton/build-wsl-cpu --output-on-failure
 ```
 
 架构测试使用显式 `MockBackend`，不会把未实现的 CPU 计算伪装为成功。
@@ -282,6 +311,9 @@ bash tools/profile_transformer_ffn.sh \
   /mnt/g/Ubuntu_/CUTriton/build-wsl-cuda/nsight-transformer 1024
 ```
 
+仓库当前提交 benchmark JSON/Markdown 数据；成功的 Nsight Compute 指标报告仍待补充，
+因此不在当前性能结论中宣称 Tensor Core 利用率或 occupancy 数据。
+
 ## 测试覆盖
 
 - KernelSpec 注册、ABI 顺序、安全 source/grid/constraint AST。
@@ -328,7 +360,7 @@ bash tools/profile_transformer_ffn.sh \
 | [`python/cutriton/kernels/`](python/cutriton/kernels/) | Python 数值参考算子 |
 | [`tools/`](tools/) | WSL 安装和薄构建 CLI |
 | [`tests/`](tests/) | CPU、CUDA、SDK 与 PyTorch 对照测试 |
-| [`benchmarks/`](benchmarks/) | ResNet-50 和轻量 Python benchmark |
+| [`benchmarks/`](benchmarks/) | ResNet-50、Transformer FFN 正确性与性能 benchmark |
 | [`docs/`](docs/) | 架构与开发文档 |
 
 ## 下一阶段

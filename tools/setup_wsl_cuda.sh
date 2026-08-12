@@ -59,21 +59,27 @@ source "$VENV_DIR/bin/activate"
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install --upgrade "torch==2.11.0" \
   --index-url https://download.pytorch.org/whl/cu130
-python -m pip install --upgrade -e "$REPOSITORY[dev,triton]"
+python -m pip install --upgrade -e "$REPOSITORY[dev,triton,benchmark]"
 
 echo "[5/6] 验证 CUDA、PyTorch 与 Triton"
 nvcc --version
 python - <<'PY'
 import torch
 import triton
+import onnx
+import onnxruntime as ort
 
 if triton.__version__ != "3.6.0":
     raise SystemExit(f"需要 Triton 3.6.0，当前为 {triton.__version__}")
 if not torch.cuda.is_available():
     raise SystemExit("torch.cuda.is_available() 为 False")
+if "CUDAExecutionProvider" not in ort.get_available_providers():
+    raise SystemExit("ONNX Runtime 缺少 CUDAExecutionProvider")
 
 print(f"PyTorch: {torch.__version__}")
 print(f"Triton: {triton.__version__}")
+print(f"ONNX: {onnx.__version__}")
+print(f"ONNX Runtime: {ort.__version__}")
 print(f"GPU: {torch.cuda.get_device_name(0)}")
 print(f"Compute Capability: {torch.cuda.get_device_capability(0)}")
 PY

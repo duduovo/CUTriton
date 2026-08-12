@@ -13,4 +13,3 @@ dist/
 *.egg-info/
 .claude
 .vscode
-tools/*.ps1
