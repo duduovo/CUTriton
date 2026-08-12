@@ -55,8 +55,9 @@ class ViewKernel final : public OpKernel {
     return Status::NotFound("Tensor description is missing: " + name);
   }
   CUTRITON_RETURN_IF_ERROR(value->tensor.Validate());
-  if (value->tensor.dtype != DataType::kFloat32) {
-    return Status::Unsupported("only float32 is supported: " + name);
+  if (value->tensor.dtype != DataType::kFloat32 &&
+      value->tensor.dtype != DataType::kFloat16) {
+    return Status::Unsupported("only float32/float16 are supported: " + name);
   }
   if (value->tensor.device_type != device.type ||
       value->tensor.device_id != device.id) {
@@ -105,8 +106,15 @@ Status ComputeCapability(int, int*) {
 
 bool ArtifactMatches(const KernelArtifact& artifact, const Node& node,
                      const Graph& graph, int capability) {
-  if (artifact.dtype != "float32" ||
-      capability < artifact.min_compute_capability) {
+  if (capability < artifact.min_compute_capability) {
+    return false;
+  }
+  const std::string reference_name = !node.outputs().empty()
+                                         ? node.outputs().front()
+                                         : node.inputs().front();
+  const auto* reference = graph.FindValue(reference_name);
+  if (reference == nullptr ||
+      artifact.dtype != DataTypeName(reference->tensor.dtype)) {
     return false;
   }
   auto layout_matches = [&](const std::string& name) {
@@ -197,12 +205,15 @@ Status CheckCudaNode(const Node& node, const Graph& graph,
 }
 
 const KernelArtifact* DefaultArtifact(const ArtifactRepository& repository,
-                                      const std::string& op_type) {
+                                      const std::string& op_type,
+                                      const std::string& dtype) {
   const auto* artifacts = repository.Find(op_type);
   if (artifacts == nullptr) return nullptr;
   const auto found = std::find_if(
       artifacts->begin(), artifacts->end(),
-      [](const KernelArtifact& artifact) { return artifact.is_default; });
+      [&](const KernelArtifact& artifact) {
+        return artifact.is_default && artifact.dtype == dtype;
+      });
   return found == artifacts->end() ? nullptr : &*found;
 }
 
@@ -243,8 +254,14 @@ class CudaTritonBackend final : public Backend {
     int capability = 0;
     CUTRITON_RETURN_IF_ERROR(
         ComputeCapability(context.options->device.id, &capability));
+    const auto* output_value =
+        context.graph->FindValue(node.outputs().front());
+    if (output_value == nullptr) {
+      return Status::NotFound("Lowered node output description is missing");
+    }
+    const std::string dtype = DataTypeName(output_value->tensor.dtype);
     const auto artifacts = context.catalog->Query(
-        node.op_type(), "float32",
+        node.op_type(), dtype,
         node.inputs().empty()
             ? std::string{}
             : context.graph->FindValue(node.inputs().front())->tensor.layout,
@@ -266,10 +283,12 @@ class CudaTritonBackend final : public Backend {
       candidate.candidate_id = alternative.candidate_id;
       if (node.op_type() == "FusedConvBatchNormRelu" ||
           node.op_type() == "FusedConvBatchNorm") {
-        const auto* conv_artifact = DefaultArtifact(*context.artifacts, "Conv");
+        const auto* conv_artifact =
+            DefaultArtifact(*context.artifacts, "Conv", dtype);
         const auto* bn_artifact =
-            DefaultArtifact(*context.artifacts, "BatchNormalization");
-        const auto* relu_artifact = DefaultArtifact(*context.artifacts, "Relu");
+            DefaultArtifact(*context.artifacts, "BatchNormalization", dtype);
+        const auto* relu_artifact =
+            DefaultArtifact(*context.artifacts, "Relu", dtype);
         if (conv_artifact == nullptr || bn_artifact == nullptr ||
             (node.op_type() == "FusedConvBatchNormRelu" &&
              relu_artifact == nullptr)) continue;
@@ -294,8 +313,10 @@ class CudaTritonBackend final : public Backend {
               *relu_artifact, {bn_output}, {node.outputs().front()}});
         }
       } else if (node.op_type() == "AddRelu") {
-        const auto* add_artifact = DefaultArtifact(*context.artifacts, "Add");
-        const auto* relu_artifact = DefaultArtifact(*context.artifacts, "Relu");
+        const auto* add_artifact =
+            DefaultArtifact(*context.artifacts, "Add", dtype);
+        const auto* relu_artifact =
+            DefaultArtifact(*context.artifacts, "Relu", dtype);
         if (add_artifact == nullptr || relu_artifact == nullptr) continue;
         const std::string sum = node.name() + "::__add";
         candidate.temporaries.push_back(
@@ -304,6 +325,34 @@ class CudaTritonBackend final : public Backend {
             *add_artifact, node.inputs(), {sum}});
         candidate.steps.push_back(KernelInvocation{
             *relu_artifact, {sum}, {node.outputs().front()}});
+      } else if (node.op_type() == "GemmGelu") {
+        const auto* gemm_artifact =
+            DefaultArtifact(*context.artifacts, "Gemm", dtype);
+        const auto* gelu_artifact =
+            DefaultArtifact(*context.artifacts, "Gelu", dtype);
+        if (gemm_artifact == nullptr || gelu_artifact == nullptr) continue;
+        const std::string projected = node.name() + "::__gemm";
+        candidate.temporaries.push_back(
+            CandidateTemporary{projected, node.outputs().front(), 0});
+        candidate.steps.push_back(KernelInvocation{
+            *gemm_artifact, node.inputs(), {projected}});
+        candidate.steps.push_back(KernelInvocation{
+            *gelu_artifact, {projected}, {node.outputs().front()}});
+      } else if (node.op_type() == "SkipLayerNormalization") {
+        const auto* add_artifact =
+            DefaultArtifact(*context.artifacts, "Add", dtype);
+        const auto* norm_artifact =
+            DefaultArtifact(*context.artifacts, "LayerNormalization", dtype);
+        if (add_artifact == nullptr || norm_artifact == nullptr) continue;
+        const std::string sum = node.name() + "::__add";
+        candidate.temporaries.push_back(
+            CandidateTemporary{sum, node.outputs().front(), 0});
+        candidate.steps.push_back(KernelInvocation{
+            *add_artifact, {node.inputs()[0], node.inputs()[1]}, {sum}});
+        candidate.steps.push_back(KernelInvocation{
+            *norm_artifact,
+            {sum, node.inputs()[2], node.inputs()[3]},
+            {node.outputs().front()}});
       }
       if (!candidate.steps.empty()) candidates->push_back(std::move(candidate));
     }

@@ -68,6 +68,7 @@ if(CUTRITON_ENABLE_CUDA)
       "${CMAKE_CURRENT_SOURCE_DIR}/python/cutriton/kernel_sdk/spec.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/python/cutriton/kernel_sdk/builder.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/python/cutriton/triton_kernels/resnet.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/python/cutriton/triton_kernels/transformer.py"
     COMMENT "Compiling CUTriton FP32 Triton kernels to PTX"
     VERBATIM
   )
@@ -87,6 +88,14 @@ if(CUTRITON_ENABLE_CUDA AND CUTRITON_BUILD_BENCHMARKS)
   target_link_libraries(cutriton_resnet50_benchmark
     PRIVATE cutriton CUDA::cuda_driver)
   target_compile_definitions(cutriton_resnet50_benchmark PRIVATE
+    CUTRITON_BENCHMARK_KERNEL_DIR="${CUTRITON_KERNEL_ARTIFACT_DIR}")
+
+  add_executable(cutriton_transformer_ffn_benchmark
+    benchmarks/transformer_ffn_native.cpp
+  )
+  target_link_libraries(cutriton_transformer_ffn_benchmark
+    PRIVATE cutriton CUDA::cuda_driver)
+  target_compile_definitions(cutriton_transformer_ffn_benchmark PRIVATE
     CUTRITON_BENCHMARK_KERNEL_DIR="${CUTRITON_KERNEL_ARTIFACT_DIR}")
 endif()
 
@@ -120,6 +129,14 @@ if(CUTRITON_BUILD_TESTS)
                 --executable $<TARGET_FILE:cutriton_resnet50_benchmark>
                 --warmup 1 --iterations 1)
       set_tests_properties(cutriton_resnet50_pytorch_reference PROPERTIES
+        LABELS "gpu;benchmark"
+        TIMEOUT 120)
+      add_test(NAME cutriton_transformer_ffn_reference
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/transformer_ffn_compare.py"
+                --executable $<TARGET_FILE:cutriton_transformer_ffn_benchmark>
+                --tokens 17 --warmup 2 --iterations 3)
+      set_tests_properties(cutriton_transformer_ffn_reference PROPERTIES
         LABELS "gpu;benchmark"
         TIMEOUT 120)
     endif()

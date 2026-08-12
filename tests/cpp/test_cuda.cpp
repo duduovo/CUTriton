@@ -4,6 +4,8 @@
 #include <cassert>
 #include <cmath>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <filesystem>
@@ -43,6 +45,83 @@ Tensor HostTensor(std::vector<int64_t> shape, const std::vector<float>& data) {
   auto buffer = Buffer::AllocateHost(desc.ByteSize());
   RequireOk(buffer->CopyFromHost(data.data(), desc.ByteSize()));
   return Tensor(desc, std::move(buffer));
+}
+
+std::uint16_t FloatToHalfBits(float value) {
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const std::uint32_t sign = (bits >> 16U) & 0x8000U;
+  int exponent = static_cast<int>((bits >> 23U) & 0xFFU) - 127 + 15;
+  std::uint32_t mantissa = bits & 0x7FFFFFU;
+  if (exponent <= 0) {
+    if (exponent < -10) return static_cast<std::uint16_t>(sign);
+    mantissa = (mantissa | 0x800000U) >> static_cast<unsigned int>(1 - exponent);
+    return static_cast<std::uint16_t>(sign | ((mantissa + 0x1000U) >> 13U));
+  }
+  if (exponent >= 31) {
+    return static_cast<std::uint16_t>(sign | 0x7C00U);
+  }
+  mantissa += 0x1000U;
+  if ((mantissa & 0x800000U) != 0) {
+    mantissa = 0;
+    ++exponent;
+    if (exponent >= 31) {
+      return static_cast<std::uint16_t>(sign | 0x7C00U);
+    }
+  }
+  return static_cast<std::uint16_t>(
+      sign | (static_cast<std::uint32_t>(exponent) << 10U) |
+      (mantissa >> 13U));
+}
+
+float HalfBitsToFloat(std::uint16_t value) {
+  const std::uint32_t sign = static_cast<std::uint32_t>(value & 0x8000U) << 16U;
+  std::uint32_t exponent = (value >> 10U) & 0x1FU;
+  std::uint32_t mantissa = value & 0x03FFU;
+  std::uint32_t bits = 0;
+  if (exponent == 0) {
+    if (mantissa == 0) {
+      bits = sign;
+    } else {
+      exponent = 113U;
+      while ((mantissa & 0x0400U) == 0) {
+        mantissa <<= 1U;
+        --exponent;
+      }
+      bits = sign | (exponent << 23U) | ((mantissa & 0x03FFU) << 13U);
+    }
+  } else if (exponent == 31) {
+    bits = sign | 0x7F800000U | (mantissa << 13U);
+  } else {
+    bits = sign | ((exponent + 112U) << 23U) | (mantissa << 13U);
+  }
+  float result = 0.0F;
+  std::memcpy(&result, &bits, sizeof(result));
+  return result;
+}
+
+std::vector<std::uint16_t> ToHalf(const std::vector<float>& values) {
+  std::vector<std::uint16_t> result(values.size());
+  std::transform(values.begin(), values.end(), result.begin(), FloatToHalfBits);
+  return result;
+}
+
+Tensor HostHalfTensor(std::vector<int64_t> shape,
+                      const std::vector<float>& data) {
+  TensorDesc desc(std::move(shape), DataType::kFloat16,
+                  DeviceType::kCPU, 0, "");
+  assert(static_cast<std::size_t>(desc.NumElements()) == data.size());
+  auto buffer = Buffer::AllocateHost(desc.ByteSize());
+  const auto half = ToHalf(data);
+  RequireOk(buffer->CopyFromHost(half.data(), desc.ByteSize()));
+  return Tensor(desc, std::move(buffer));
+}
+
+void AddHalfConstant(Model* model, const std::string& name,
+                     std::vector<int64_t> shape,
+                     const std::vector<float>& data) {
+  RequireOk(model->AddConstant(
+      name, HostHalfTensor(std::move(shape), data)));
 }
 
 void AddConstant(Model* model, const std::string& name,
@@ -223,6 +302,143 @@ void TestAutotuningAndCache(const std::vector<float>& input,
   std::filesystem::remove_all(cache_directory);
 }
 
+Model BuildTransformerFfnModel(int tokens, const std::vector<float>& weights,
+                               const std::vector<float>& scale,
+                               const std::vector<float>& bias) {
+  constexpr int hidden = 128;
+  constexpr int intermediate = 512;
+  Model model;
+  auto& graph = model.graph();
+  RequireOk(graph.AddInput(
+      "x", TensorDesc({tokens, hidden}, DataType::kFloat16,
+                      DeviceType::kCPU, 0, "")));
+  RequireOk(graph.AddInput(
+      "residual", TensorDesc({tokens, intermediate}, DataType::kFloat16,
+                             DeviceType::kCPU, 0, "")));
+  AddHalfConstant(&model, "weight", {hidden, intermediate}, weights);
+  AddHalfConstant(&model, "scale", {intermediate}, scale);
+  AddHalfConstant(&model, "bias", {intermediate}, bias);
+  RequireOk(graph.AddNode(
+      Node("projection", "Gemm", {"x", "weight"}, {"projected"})));
+  RequireOk(graph.AddNode(
+      Node("activation", "Gelu", {"projected"}, {"activated"})));
+  RequireOk(graph.AddNode(Node("residual_add", "Add",
+                               {"activated", "residual"}, {"sum"})));
+  Node norm("output_norm", "LayerNormalization",
+            {"sum", "scale", "bias"}, {"output"});
+  norm.SetAttribute("axis", static_cast<int64_t>(-1));
+  norm.SetAttribute("epsilon", 1e-5);
+  RequireOk(graph.AddNode(std::move(norm)));
+  RequireOk(graph.AddOutput("output"));
+  return model;
+}
+
+void TestFp16TransformerFusions(const CompileOptions& base_options) {
+  constexpr int tokens = 17;
+  constexpr int hidden = 128;
+  constexpr int intermediate = 512;
+  std::vector<float> input(tokens * hidden);
+  std::vector<float> residual(tokens * intermediate);
+  std::vector<float> weights(hidden * intermediate);
+  std::vector<float> scale(intermediate);
+  std::vector<float> bias(intermediate);
+  for (std::size_t index = 0; index < input.size(); ++index) {
+    input[index] = static_cast<float>(static_cast<int>(index % 23) - 11) / 37.0F;
+  }
+  for (std::size_t index = 0; index < residual.size(); ++index) {
+    residual[index] = static_cast<float>(static_cast<int>(index % 17) - 8) / 53.0F;
+  }
+  for (std::size_t index = 0; index < weights.size(); ++index) {
+    weights[index] = static_cast<float>(static_cast<int>(index % 19) - 9) / 181.0F;
+  }
+  for (int index = 0; index < intermediate; ++index) {
+    scale[static_cast<std::size_t>(index)] = 0.9F + 0.001F * (index % 13);
+    bias[static_cast<std::size_t>(index)] =
+        static_cast<float>((index % 7) - 3) / 100.0F;
+  }
+
+  std::vector<float> expected(tokens * intermediate);
+  for (int row = 0; row < tokens; ++row) {
+    for (int column = 0; column < intermediate; ++column) {
+      float value = 0.0F;
+      for (int inner = 0; inner < hidden; ++inner) {
+        value += input[static_cast<std::size_t>(row * hidden + inner)] *
+                 weights[static_cast<std::size_t>(inner * intermediate + column)];
+      }
+      value = 0.5F * value *
+              (1.0F + std::erf(value * 0.7071067811865476F));
+      expected[static_cast<std::size_t>(row * intermediate + column)] =
+          value + residual[static_cast<std::size_t>(row * intermediate + column)];
+    }
+    double mean = 0.0;
+    for (int column = 0; column < intermediate; ++column) {
+      mean += expected[static_cast<std::size_t>(row * intermediate + column)];
+    }
+    mean /= intermediate;
+    double variance = 0.0;
+    for (int column = 0; column < intermediate; ++column) {
+      const double centered =
+          expected[static_cast<std::size_t>(row * intermediate + column)] - mean;
+      variance += centered * centered;
+    }
+    variance /= intermediate;
+    for (int column = 0; column < intermediate; ++column) {
+      const std::size_t index =
+          static_cast<std::size_t>(row * intermediate + column);
+      expected[index] = static_cast<float>(
+          ((expected[index] - mean) / std::sqrt(variance + 1e-5)) *
+              scale[static_cast<std::size_t>(column)] +
+          bias[static_cast<std::size_t>(column)]);
+    }
+  }
+
+  CompileOptions options = base_options;
+  options.enable_cuda_graph = true;
+  options.enable_profiling = true;
+  options.tuning_mode = TuningMode::kDisabled;
+  std::unique_ptr<Engine> engine;
+  RequireOk(BuildEngine(
+      BuildTransformerFfnModel(tokens, weights, scale, bias), options, &engine));
+  assert(engine->plan().ops().size() == 2);
+  assert(engine->plan().ops()[0].op_type == "GemmGelu");
+  assert(engine->plan().ops()[0].candidates.size() == 5);
+  assert(engine->plan().ops()[1].op_type == "SkipLayerNormalization");
+  assert(engine->plan().ops()[1].candidates.size() == 3);
+
+  auto context = engine->CreateExecutionContext();
+  const auto input_desc = engine->plan().graph().FindValue("x")->tensor;
+  const auto residual_desc = engine->plan().graph().FindValue("residual")->tensor;
+  const auto output_desc = engine->plan().graph().FindValue("output")->tensor;
+  std::shared_ptr<Buffer> input_buffer;
+  std::shared_ptr<Buffer> residual_buffer;
+  std::shared_ptr<Buffer> output_buffer;
+  RequireOk(Buffer::AllocateCuda(input_desc.ByteSize(), 0, &input_buffer));
+  RequireOk(Buffer::AllocateCuda(residual_desc.ByteSize(), 0, &residual_buffer));
+  RequireOk(Buffer::AllocateCuda(output_desc.ByteSize(), 0, &output_buffer));
+  const auto input_half = ToHalf(input);
+  const auto residual_half = ToHalf(residual);
+  RequireOk(input_buffer->CopyFromHost(input_half.data(), input_desc.ByteSize()));
+  RequireOk(residual_buffer->CopyFromHost(
+      residual_half.data(), residual_desc.ByteSize()));
+  RequireOk(context->BindInput("x", Tensor(input_desc, input_buffer)));
+  RequireOk(context->BindInput(
+      "residual", Tensor(residual_desc, residual_buffer)));
+  RequireOk(context->BindOutput("output", Tensor(output_desc, output_buffer)));
+  RequireOk(context->Run());
+  std::vector<std::uint16_t> actual_half(expected.size());
+  RequireOk(output_buffer->CopyToHost(actual_half.data(), output_desc.ByteSize()));
+  for (std::size_t index = 0; index < expected.size(); ++index) {
+    const float actual = HalfBitsToFloat(actual_half[index]);
+    const float tolerance = 2e-2F + 2e-2F * std::abs(expected[index]);
+    if (!std::isfinite(actual) || std::abs(actual - expected[index]) > tolerance) {
+      std::cerr << "FP16 Transformer mismatch at " << index << ": "
+                << actual << " vs " << expected[index] << std::endl;
+      std::abort();
+    }
+  }
+  assert(context->cached_cuda_graph_count() == 1);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -391,6 +607,7 @@ int main(int argc, char** argv) {
 
   TestDynamicShapeProfile(conv_weights, fc_weights, options);
   TestAutotuningAndCache(input, conv_weights, fc_weights, expected, options);
+  TestFp16TransformerFusions(options);
 
   std::cout << "CUTriton CUDA/Triton ResNet stem test passed" << std::endl;
   return 0;

@@ -180,7 +180,8 @@ Status Compiler::Compile(const Model& model, const CompileOptions& options,
     }
   }
 
-  auto passes = CreateDefaultCompilePasses();
+  auto passes =
+      CreateDefaultCompilePasses(options.enable_transformer_fusions);
   CUTRITON_RETURN_IF_ERROR(passes.Run(&result.mutable_graph()));
 
   if (options.target == "cuda_triton") {

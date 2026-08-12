@@ -47,6 +47,11 @@ Status RegisterBuiltinFusionAlternatives() {
            FusionAlternative{"FusedConvBatchNorm", "unfused:conv_bn",
                              {"Conv", "BatchNormalization"}},
            FusionAlternative{"AddRelu", "unfused:add_relu", {"Add", "Relu"}},
+           FusionAlternative{"GemmGelu", "unfused:gemm_gelu",
+                             {"Gemm", "Gelu"}},
+           FusionAlternative{"SkipLayerNormalization",
+                             "unfused:add_layer_norm",
+                             {"Add", "LayerNormalization"}},
        }) {
     const Status status = registry.Register(std::move(alternative));
     if (!status.ok() && status.code() != ErrorCode::kAlreadyExists) return status;

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -30,6 +31,57 @@ namespace {
 bool Contains(const std::vector<std::string>& values, const std::string& name) {
   return std::find(values.begin(), values.end(), name) != values.end();
 }
+
+#if CUTRITON_ENABLE_CUDA
+float HalfBitsToFloat(std::uint16_t value) {
+  const std::uint32_t sign = static_cast<std::uint32_t>(value & 0x8000U) << 16U;
+  std::uint32_t exponent = (value >> 10U) & 0x1FU;
+  std::uint32_t mantissa = value & 0x03FFU;
+  std::uint32_t bits = 0;
+  if (exponent == 0) {
+    if (mantissa == 0) {
+      bits = sign;
+    } else {
+      exponent = 113U;
+      while ((mantissa & 0x0400U) == 0) {
+        mantissa <<= 1U;
+        --exponent;
+      }
+      mantissa &= 0x03FFU;
+      bits = sign | (exponent << 23U) | (mantissa << 13U);
+    }
+  } else if (exponent == 31) {
+    bits = sign | 0x7F800000U | (mantissa << 13U);
+  } else {
+    bits = sign | ((exponent + 112U) << 23U) | (mantissa << 13U);
+  }
+  float result = 0.0F;
+  std::memcpy(&result, &bits, sizeof(result));
+  return result;
+}
+
+Status CopyTensorAsFloat(const Tensor& tensor, std::vector<float>* output) {
+  if (output == nullptr) {
+    return Status::InvalidArgument("tuning output vector is null");
+  }
+  const auto count = static_cast<std::size_t>(tensor.desc().NumElements());
+  output->assign(count, 0.0F);
+  if (tensor.desc().dtype == DataType::kFloat32) {
+    return tensor.buffer()->CopyToHost(output->data(), tensor.desc().ByteSize(),
+                                       tensor.byte_offset());
+  }
+  if (tensor.desc().dtype == DataType::kFloat16) {
+    std::vector<std::uint16_t> values(count);
+    CUTRITON_RETURN_IF_ERROR(tensor.buffer()->CopyToHost(
+        values.data(), tensor.desc().ByteSize(), tensor.byte_offset()));
+    for (std::size_t index = 0; index < count; ++index) {
+      (*output)[index] = HalfBitsToFloat(values[index]);
+    }
+    return Status::OK();
+  }
+  return Status::Unsupported("tuning comparison supports float32/float16 only");
+}
+#endif
 
 Status ValidateBoundTensor(const std::string& name, const TensorDesc& expected,
                            const Tensor& tensor) {
@@ -773,11 +825,9 @@ Status ExecutionContext::PrepareTuning() {
       CUTRITON_RETURN_IF_ERROR(CudaStatus(cuStreamSynchronize(stream),
                                          "cuStreamSynchronize"));
       const Tensor& candidate_output = tensors_.at(op.outputs.front());
-      std::vector<float> host_output(
-          static_cast<std::size_t>(candidate_output.desc().NumElements()));
-      CUTRITON_RETURN_IF_ERROR(candidate_output.buffer()->CopyToHost(
-          host_output.data(), candidate_output.desc().ByteSize(),
-          candidate_output.byte_offset()));
+      std::vector<float> host_output;
+      CUTRITON_RETURN_IF_ERROR(
+          CopyTensorAsFloat(candidate_output, &host_output));
       if (reference_output.empty()) {
         reference_output = host_output;
       } else {
@@ -785,7 +835,11 @@ Status ExecutionContext::PrepareTuning() {
         for (std::size_t element = 0; element < host_output.size(); ++element) {
           const float expected = reference_output[element];
           const float actual = host_output[element];
-          const float tolerance = 1e-4F + 1e-4F * std::abs(expected);
+          const float relative = candidate_output.desc().dtype ==
+                                         DataType::kFloat16
+                                     ? 1e-2F
+                                     : 1e-4F;
+          const float tolerance = relative + relative * std::abs(expected);
           if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance) {
             matches = false;
             break;

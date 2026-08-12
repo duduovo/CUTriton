@@ -159,12 +159,71 @@ Status InferGemm(Graph* graph, const Node& node) {
       b->tensor.shape.size() != 2) {
     return Status::ShapeError("Gemm 期望 rank-2 输入");
   }
+  if (a->tensor.dtype != b->tensor.dtype) {
+    return Status::ShapeError("Gemm inputs must have the same dtype");
+  }
+  const bool trans_a = GetIntAttribute(node, "transA", 0) != 0;
   const bool trans_b = GetIntAttribute(node, "transB", 0) != 0;
+  const int64_t m = trans_a ? a->tensor.shape[1] : a->tensor.shape[0];
+  const int64_t a_k = trans_a ? a->tensor.shape[0] : a->tensor.shape[1];
+  const int64_t b_k = trans_b ? b->tensor.shape[1] : b->tensor.shape[0];
   const int64_t n = trans_b ? b->tensor.shape[0] : b->tensor.shape[1];
-  TensorDesc desc({a->tensor.shape[0], n}, a->tensor.dtype,
+  if (a_k != b_k) {
+    return Status::ShapeError("Gemm inner dimensions do not match");
+  }
+  if (node.inputs().size() == 3) {
+    const auto* bias = graph->FindValue(node.inputs()[2]);
+    if (bias == nullptr || bias->tensor.dtype != a->tensor.dtype ||
+        (bias->tensor.shape != std::vector<int64_t>{n} &&
+         bias->tensor.shape != std::vector<int64_t>{m, n})) {
+      return Status::ShapeError("Gemm bias must be [N] or [M,N]");
+    }
+  }
+  TensorDesc desc({m, n}, a->tensor.dtype,
                   a->tensor.device_type, a->tensor.device_id, "");
   CUTRITON_RETURN_IF_ERROR(desc.Validate());
   return graph->SetValueDesc(node.outputs()[0], std::move(desc));
+}
+
+Status InferLayerNormalization(Graph* graph, const Node& node) {
+  if (node.inputs().size() < 2 || node.inputs().size() > 3) {
+    return Status::ShapeError("LayerNormalization expects input, scale and optional bias");
+  }
+  const auto* input = graph->FindValue(node.inputs()[0]);
+  const auto* scale = graph->FindValue(node.inputs()[1]);
+  if (input == nullptr || scale == nullptr || input->tensor.shape.empty() ||
+      scale->tensor.shape !=
+          std::vector<int64_t>{input->tensor.shape.back()} ||
+      input->tensor.dtype != scale->tensor.dtype) {
+    return Status::ShapeError("LayerNormalization scale must match the last dimension");
+  }
+  if (node.inputs().size() == 3) {
+    const auto* bias = graph->FindValue(node.inputs()[2]);
+    if (bias == nullptr || bias->tensor.shape != scale->tensor.shape ||
+        bias->tensor.dtype != input->tensor.dtype) {
+      return Status::ShapeError("LayerNormalization bias must match scale");
+    }
+  }
+  const int64_t axis = GetIntAttribute(node, "axis", -1);
+  if (axis != -1 && axis != static_cast<int64_t>(input->tensor.shape.size()) - 1) {
+    return Status::Unsupported("only last-axis LayerNormalization is supported");
+  }
+  return graph->SetValueDesc(node.outputs()[0], input->tensor);
+}
+
+Status InferSkipLayerNormalization(Graph* graph, const Node& node) {
+  if (node.inputs().size() != 4) {
+    return Status::ShapeError(
+        "SkipLayerNormalization expects input, residual, scale and bias");
+  }
+  Node add(node.name() + "::__shape_add", "Add",
+           {node.inputs()[0], node.inputs()[1]}, {node.outputs()[0]});
+  CUTRITON_RETURN_IF_ERROR(InferElementwiseBinary(graph, add));
+  Node layer_norm(node.name() + "::__shape_layer_norm", "LayerNormalization",
+                  {node.outputs()[0], node.inputs()[2], node.inputs()[3]},
+                  node.outputs());
+  layer_norm.SetAttribute("axis", GetIntAttribute(node, "axis", -1));
+  return InferLayerNormalization(graph, layer_norm);
 }
 
 Status InferGlobalAveragePool(Graph* graph, const Node& node) {
@@ -361,6 +420,86 @@ class AddReluFusionPass final : public GraphPass {
   }
 };
 
+class GemmGeluFusionPass final : public GraphPass {
+ public:
+  const char* name() const override { return "gemm_gelu_fusion"; }
+
+  Status Run(Graph* graph) const override {
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      const auto consumers = graph->BuildConsumerMap();
+      for (auto& gemm : graph->mutable_nodes()) {
+        if (gemm.op_type() != "Gemm" || gemm.outputs().size() != 1 ||
+            std::find(graph->outputs().begin(), graph->outputs().end(),
+                      gemm.outputs()[0]) != graph->outputs().end()) {
+          continue;
+        }
+        const auto found = consumers.find(gemm.outputs()[0]);
+        if (found == consumers.end() || found->second.size() != 1) continue;
+        const int gelu_id = found->second.front();
+        if (gelu_id < 0 || gelu_id >= static_cast<int>(graph->nodes().size())) continue;
+        const Node& gelu = graph->nodes()[gelu_id];
+        if (gelu.op_type() != "Gelu" || gelu.inputs().size() != 1 ||
+            gelu.outputs().size() != 1) {
+          continue;
+        }
+        gemm.set_name(gemm.name() + "_gelu");
+        gemm.set_op_type("GemmGelu");
+        gemm.set_outputs(gelu.outputs());
+        CUTRITON_RETURN_IF_ERROR(graph->RemoveNodes({gelu_id}));
+        changed = true;
+        break;
+      }
+    }
+    return Status::OK();
+  }
+};
+
+class SkipLayerNormalizationFusionPass final : public GraphPass {
+ public:
+  const char* name() const override { return "skip_layer_norm_fusion"; }
+
+  Status Run(Graph* graph) const override {
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      const auto consumers = graph->BuildConsumerMap();
+      for (auto& add : graph->mutable_nodes()) {
+        if (add.op_type() != "Add" || add.outputs().size() != 1 ||
+            std::find(graph->outputs().begin(), graph->outputs().end(),
+                      add.outputs()[0]) != graph->outputs().end()) {
+          continue;
+        }
+        const auto found = consumers.find(add.outputs()[0]);
+        if (found == consumers.end() || found->second.size() != 1) continue;
+        const int norm_id = found->second.front();
+        if (norm_id < 0 || norm_id >= static_cast<int>(graph->nodes().size())) continue;
+        const Node& norm = graph->nodes()[norm_id];
+        if (norm.op_type() != "LayerNormalization" ||
+            norm.inputs().size() != 3 || norm.outputs().size() != 1 ||
+            norm.inputs()[0] != add.outputs()[0]) {
+          continue;
+        }
+        std::vector<std::string> inputs = add.inputs();
+        inputs.push_back(norm.inputs()[1]);
+        inputs.push_back(norm.inputs()[2]);
+        add.set_name(add.name() + "_layer_norm");
+        add.set_op_type("SkipLayerNormalization");
+        add.set_inputs(std::move(inputs));
+        add.set_outputs(norm.outputs());
+        add.SetAttribute("axis", GetIntAttribute(norm, "axis", -1));
+        add.SetAttribute("epsilon",
+                         norm.GetAttribute<double>("epsilon").value_or(1e-5));
+        CUTRITON_RETURN_IF_ERROR(graph->RemoveNodes({norm_id}));
+        changed = true;
+        break;
+      }
+    }
+    return Status::OK();
+  }
+};
+
 class FlattenGemmNormalizationPass final : public GraphPass {
  public:
   const char* name() const override { return "flatten_gemm_normalization"; }
@@ -427,9 +566,14 @@ Status RegisterBuiltinOpSchemas() {
       add(OpSchema{"FusedConvBatchNormRelu", 6, 6, 1, conv}));
   CUTRITON_RETURN_IF_ERROR(add(OpSchema{
       "BatchNormalization", 5, 5, 1, same_as_input}));
-  for (const auto& op : {"Relu", "Gelu", "Softmax", "LayerNormalization"}) {
+  for (const auto& op : {"Relu", "Gelu", "Softmax"}) {
     CUTRITON_RETURN_IF_ERROR(add(OpSchema{op, 1, 1, 1, same_as_input}));
   }
+  CUTRITON_RETURN_IF_ERROR(add(OpSchema{
+      "LayerNormalization", 2, 3, 1,
+      [](Graph* graph, const Node& node) {
+        return InferLayerNormalization(graph, node);
+      }}));
   const ShapeInferenceFunction binary =
       [](Graph* graph, const Node& node) {
         return InferElementwiseBinary(graph, node);
@@ -443,7 +587,13 @@ Status RegisterBuiltinOpSchemas() {
     return InferGemm(graph, node);
   };
   CUTRITON_RETURN_IF_ERROR(add(OpSchema{"Gemm", 2, 3, 1, gemm}));
+  CUTRITON_RETURN_IF_ERROR(add(OpSchema{"GemmGelu", 2, 3, 1, gemm}));
   CUTRITON_RETURN_IF_ERROR(add(OpSchema{"MatMul", 2, 2, 1, gemm}));
+  CUTRITON_RETURN_IF_ERROR(add(OpSchema{
+      "SkipLayerNormalization", 4, 4, 1,
+      [](Graph* graph, const Node& node) {
+        return InferSkipLayerNormalization(graph, node);
+      }}));
   const ShapeInferenceFunction pool = [](Graph* graph, const Node& node) {
     return InferPool(graph, node);
   };
@@ -497,6 +647,14 @@ std::unique_ptr<GraphPass> CreateAddReluFusionPass() {
   return std::make_unique<AddReluFusionPass>();
 }
 
+std::unique_ptr<GraphPass> CreateGemmGeluFusionPass() {
+  return std::make_unique<GemmGeluFusionPass>();
+}
+
+std::unique_ptr<GraphPass> CreateSkipLayerNormalizationFusionPass() {
+  return std::make_unique<SkipLayerNormalizationFusionPass>();
+}
+
 std::unique_ptr<GraphPass> CreateFlattenGemmNormalizationPass() {
   return std::make_unique<FlattenGemmNormalizationPass>();
 }
@@ -505,7 +663,7 @@ std::unique_ptr<GraphPass> CreateStaticShapeValidationPass() {
   return std::make_unique<StaticShapeValidationPass>();
 }
 
-PassManager CreateDefaultCompilePasses() {
+PassManager CreateDefaultCompilePasses(bool enable_transformer_fusions) {
   PassManager manager;
   manager.Add(CreateTopologicalSortPass());
   manager.Add(CreateShapeInferencePass());
@@ -513,6 +671,10 @@ PassManager CreateDefaultCompilePasses() {
   manager.Add(CreateDeadNodeEliminationPass());
   manager.Add(CreateConvBatchNormReluFusionPass());
   manager.Add(CreateAddReluFusionPass());
+  if (enable_transformer_fusions) {
+    manager.Add(CreateGemmGeluFusionPass());
+    manager.Add(CreateSkipLayerNormalizationFusionPass());
+  }
   manager.Add(CreateTopologicalSortPass());
   manager.Add(CreateShapeInferencePass());
   manager.Add(CreateFlattenGemmNormalizationPass());
